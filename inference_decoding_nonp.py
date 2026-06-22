@@ -132,7 +132,7 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images"):
     #     *[eval_prompt_fn() for _ in range(args.bs)]
     # )
     # eval_prompts = list(eval_prompts)
-    eval_prompts = [eval_prompt_fn()[0] * args.bs
+    eval_prompts = [eval_prompt_fn()[0]] * args.bs
     eval_prompt_list.extend(eval_prompts)
     print(eval_prompts)
     
