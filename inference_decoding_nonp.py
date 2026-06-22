@@ -133,6 +133,7 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images"):
     )
     eval_prompts = list(eval_prompts)
     eval_prompt_list.extend(eval_prompts)
+    print(eval_prompts)
     
     image_, kl_loss = sd_model(eval_prompts, num_images_per_prompt=1, eta=1.0, latents=init_i) # List of PIL.Image objects
     image.extend(image_)
