@@ -128,10 +128,11 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images"):
         init_i = None
     else:
         init_i = init_latents[i]
-    eval_prompts, _ = zip(
-        *[eval_prompt_fn() for _ in range(args.bs)]
-    )
-    eval_prompts = list(eval_prompts)
+    # eval_prompts, _ = zip(
+    #     *[eval_prompt_fn() for _ in range(args.bs)]
+    # )
+    # eval_prompts = list(eval_prompts)
+    eval_prompts = [eval_prompt_fn()] * args.bs
     eval_prompt_list.extend(eval_prompts)
     print(eval_prompts)
     
@@ -146,6 +147,9 @@ torch.cuda.synchronize() # Wait for the events to complete
 gpu_time = start_event.elapsed_time(end_event)/1000 # Time in seconds
 max_memory = torch.cuda.max_memory_allocated()
 max_memory_used = (max_memory - initial_memory) / (1024 ** 2)
+
+print("GPUTimeInS:", gpu_time)
+print("MaxMemoryInMb:", max_memory_used)
 
 wandb.log({
         "GPUTimeInS": gpu_time,
@@ -185,7 +189,7 @@ with torch.no_grad():
 
     eval_rewards = torch.tensor(eval_rewards)
 
-
+    print(f"eval_{args.reward}_rewards", eval_rewards)
     print(f"eval_{args.reward}_rewards_mean", torch.mean(eval_rewards))
 
     
