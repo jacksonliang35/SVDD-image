@@ -70,7 +70,7 @@ end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 initial_memory = torch.cuda.memory_allocated()
 
-sd_model = Decoding_nonbatch_SDPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", local_files_only=True)
+sd_model = Decoding_nonbatch_SDPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", local_files_only=False)
 sd_model.to(device)
 
 # switch to DDIM scheduler
