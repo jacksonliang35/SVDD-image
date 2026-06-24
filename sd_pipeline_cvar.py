@@ -158,7 +158,7 @@ def solve_cvar_eta_time0_from_costs(
     }
 
 
-class CVaR_Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
+class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
     """
     Non-batched SVDD decoding with CVaR/tail-controlled resampling.
 
@@ -955,174 +955,243 @@ class CVaR_Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
 
         return image, kl_loss
 
-@torch.no_grad()
-def sample_max(
-    self,
-    prompt: Union[str, List[str]] = None,
-    height: Optional[int] = None,
-    width: Optional[int] = None,
-    num_inference_steps: int = 50,
-    guidance_scale: float = 7.5,
-    negative_prompt: Optional[Union[str, List[str]]] = None,
-    num_images_per_prompt: Optional[int] = 1,
-    eta: float = 0.0,
-    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-    latents: Optional[torch.FloatTensor] = None,
-    prompt_embeds: Optional[torch.FloatTensor] = None,
-    negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-    output_type: Optional[str] = "pil",
-    return_dict: bool = True,
-    callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-    callback_steps: int = 1,
-    cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-    cvar_eta: Optional[float] = None,
-    auto_solve_cvar_eta: bool = False,
-    pretrained_costs: Optional[ArrayLike] = None,
-    num_pretrained_samples: int = 64,
-    pretrained_batch_size: Optional[int] = None,
-    eta_grid_size: int = 2001,
-):
-    """
-    Generate images using CVaR/tail-controlled non-batched decoding.
+    @torch.no_grad()
+    def sample_max(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        cvar_eta: Optional[float] = None,
+        auto_solve_cvar_eta: bool = False,
+        pretrained_costs: Optional[ArrayLike] = None,
+        num_pretrained_samples: int = 64,
+        pretrained_batch_size: Optional[int] = None,
+        eta_grid_size: int = 2001,
+    ):
+        """
+        Generate images using CVaR/tail-controlled non-batched decoding.
 
-    Args added relative to Decoding_nonbatch_SDPipeline:
-        cvar_eta: CVaR threshold eta. If None, uses self.cvar_eta.
-        auto_solve_cvar_eta: If True, solve eta before decoding.  If
-            pretrained_costs is provided, solve from those; otherwise sample
-            from the pre-trained StableDiffusionPipeline.
-        pretrained_costs: Optional precomputed costs from pre-trained samples.
-        num_pretrained_samples: Number of pre-trained samples for eta solving.
-        pretrained_batch_size: Batch size for pre-trained eta samples.
-        eta_grid_size: Grid size for empirical eta search.
+        Args added relative to Decoding_nonbatch_SDPipeline:
+            cvar_eta: CVaR threshold eta. If None, uses self.cvar_eta.
+            auto_solve_cvar_eta: If True, solve eta before decoding.  If
+                pretrained_costs is provided, solve from those; otherwise sample
+                from the pre-trained StableDiffusionPipeline.
+            pretrained_costs: Optional precomputed costs from pre-trained samples.
+            num_pretrained_samples: Number of pre-trained samples for eta solving.
+            pretrained_batch_size: Batch size for pre-trained eta samples.
+            eta_grid_size: Grid size for empirical eta search.
 
-    Note: the existing argument `eta` remains DDIM eta, not CVaR eta.
-    """
-    self._ensure_cvar_defaults()
-    self._validate_alpha_beta(float(self.alpha), float(self.beta))
+        Note: the existing argument `eta` remains DDIM eta, not CVaR eta.
+        """
+        self._ensure_cvar_defaults()
+        self._validate_alpha_beta(float(self.alpha), float(self.beta))
 
-    # 0. Default height and width to unet.
-    height = height or self.unet.config.sample_size * self.vae_scale_factor
-    width = width or self.unet.config.sample_size * self.vae_scale_factor
+        # 0. Default height and width to unet.
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-    # 1. Check inputs.
-    self.check_inputs(
-        prompt,
-        height,
-        width,
-        callback_steps,
-        negative_prompt,
-        prompt_embeds,
-        negative_prompt_embeds,
-    )
-
-    # Optional time-0 eta solving before the controlled rollout.
-    print("Obtaining CVaR_eta...")
-
-    if cvar_eta is not None:
-        self.cvar_eta = float(cvar_eta)
-    elif auto_solve_cvar_eta:
-        if pretrained_costs is not None:
-            self.solve_cvar_eta_from_costs(pretrained_costs, grid_size=eta_grid_size)
-        else:
-            if prompt is None:
-                raise ValueError("auto_solve_cvar_eta=True with no pretrained_costs requires prompt, not only prompt_embeds.")
-            self.solve_cvar_eta_from_pretrained(
-                prompt=prompt,
-                num_pretrained_samples=num_pretrained_samples,
-                pretrained_batch_size=pretrained_batch_size,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                negative_prompt=negative_prompt,
-                generator=generator,
-                grid_size=eta_grid_size,
-                cross_attention_kwargs=cross_attention_kwargs,
-            )
-
-    if self.cvar_eta is None:
-        raise RuntimeError(
-            "cvar_eta is not set. Call solve_cvar_eta_from_pretrained(...), "
-            "solve_cvar_eta_from_costs(...), set_cvar_eta(...), or pass cvar_eta=... ."
+        # 1. Check inputs.
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            callback_steps,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
         )
 
-    print("CVaR_eta:", self.cvar_eta)
+        # Optional time-0 eta solving before the controlled rollout.
+        print("Obtaining CVaR_eta...")
 
-    # 2. Define call parameters.
-    if prompt is not None and isinstance(prompt, str):
-        batch_size = 1
-    elif prompt is not None and isinstance(prompt, list):
-        batch_size = len(prompt)
-    else:
-        batch_size = prompt_embeds.shape[0]
-
-    device = self._execution_device
-    do_classifier_free_guidance = guidance_scale > 1.0
-
-    # 3. Encode input prompt.
-    prompt_embeds = self._encode_prompt(
-        prompt,
-        device,
-        num_images_per_prompt,
-        do_classifier_free_guidance,
-        negative_prompt,
-        prompt_embeds=prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
-    )
-
-    # 4. Prepare timesteps.
-    self.scheduler.set_timesteps(num_inference_steps, device=device)
-    timesteps = self.scheduler.timesteps
-
-    # 5. Prepare latent variables.
-    num_channels_latents = self.unet.config.in_channels
-    latents = self.prepare_latents(
-        batch_size * num_images_per_prompt,
-        num_channels_latents,
-        height,
-        width,
-        prompt_embeds.dtype,
-        device,
-        generator,
-        latents,
-    )
-    num_particles = latents.shape[0]
-
-    # Keep the call for compatibility with the original pipeline even though
-    # ddim_step_KL consumes eta directly below.
-    _ = self.prepare_extra_step_kwargs(generator, eta)
-
-    # 7. Denoising loop.
-    kl_loss = 0
-    num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-
-    with self.progress_bar(total=num_inference_steps) as progress_bar:
-        for step_index, t in enumerate(timesteps):
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-            noise_pred = self.unet(
-                latent_model_input,
-                t,
-                encoder_hidden_states=prompt_embeds,
-                cross_attention_kwargs=cross_attention_kwargs,
-            ).sample
-
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                old_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        if cvar_eta is not None:
+            self.cvar_eta = float(cvar_eta)
+        elif auto_solve_cvar_eta:
+            if pretrained_costs is not None:
+                self.solve_cvar_eta_from_costs(pretrained_costs, grid_size=eta_grid_size)
             else:
-                old_noise_pred = noise_pred
+                if prompt is None:
+                    raise ValueError("auto_solve_cvar_eta=True with no pretrained_costs requires prompt, not only prompt_embeds.")
+                self.solve_cvar_eta_from_pretrained(
+                    prompt=prompt,
+                    num_pretrained_samples=num_pretrained_samples,
+                    pretrained_batch_size=pretrained_batch_size,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    negative_prompt=negative_prompt,
+                    generator=generator,
+                    grid_size=eta_grid_size,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
 
-            noise_pred = old_noise_pred
+        if self.cvar_eta is None:
+            raise RuntimeError(
+                "cvar_eta is not set. Call solve_cvar_eta_from_pretrained(...), "
+                "solve_cvar_eta_from_costs(...), set_cvar_eta(...), or pass cvar_eta=... ."
+            )
 
-            if step_index < len(timesteps) - 1:
-                log_weights_list: List[np.ndarray] = []
-                latents_list: List[np.ndarray] = []
-                latent_dtype = latents.dtype
+        print("CVaR_eta:", self.cvar_eta)
 
-                for _dup_index in range(int(self.duplicate)):
-                    latents_duplicate, kl_terms = ddim_step_KL(
+        # 2. Define call parameters.
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode input prompt.
+        prompt_embeds = self._encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+        )
+
+        # 4. Prepare timesteps.
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 5. Prepare latent variables.
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+        num_particles = latents.shape[0]
+
+        # Keep the call for compatibility with the original pipeline even though
+        # ddim_step_KL consumes eta directly below.
+        _ = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 7. Denoising loop.
+        kl_loss = 0
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for step_index, t in enumerate(timesteps):
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                ).sample
+
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    old_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                else:
+                    old_noise_pred = noise_pred
+
+                noise_pred = old_noise_pred
+
+                if step_index < len(timesteps) - 1:
+                    log_weights_list: List[np.ndarray] = []
+                    latents_list: List[np.ndarray] = []
+                    latent_dtype = latents.dtype
+
+                    for _dup_index in range(int(self.duplicate)):
+                        latents_duplicate, kl_terms = ddim_step_KL(
+                            self.scheduler,
+                            noise_pred,
+                            old_noise_pred,
+                            t,
+                            latents,
+                            eta=eta,
+                        )
+                        kl_loss += torch.mean(kl_terms)
+
+                        duplicate_model_input = (
+                            torch.cat([latents_duplicate] * 2)
+                            if do_classifier_free_guidance
+                            else latents_duplicate
+                        )
+                        duplicate_model_input = self.scheduler.scale_model_input(
+                            duplicate_model_input,
+                            timesteps[step_index + 1],
+                        )
+
+                        noise_pred_duplicate = self.unet(
+                            duplicate_model_input,
+                            timesteps[step_index + 1],
+                            encoder_hidden_states=prompt_embeds,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                        ).sample
+
+                        if do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
+                            new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        else:
+                            new_noise_pred = noise_pred_duplicate
+
+                        values = self.calculate_cvar_value(
+                                latents=latents_duplicate,
+                                new_noise_pred=new_noise_pred,
+                                t=timesteps[step_index + 1],
+                                cvar_eta=self.cvar_eta,
+                            )
+
+                        values_list.append(values)
+                        latents_list.append(latents_duplicate.detach().cpu().numpy())
+
+                    # Shapes:
+                    #   log_weights_array: [duplicate, num_particles]
+                    #   latents_array:     [duplicate, num_particles, C, H, W]
+                    values_array = np.asarray(values_list, dtype=np.float32)
+                    latents_array = np.asarray(latents_list)
+
+                    index_chosen: List[int] = []
+                    for particle_index in range(num_particles):
+                        values_b = values_array[:, particle_index]
+
+                        # Cost-side version of reward argmax:
+                        # reward max <=> cost/CVaR-value min.
+                        chosen_dup = int(np.argmin(values_b))
+
+                        index_chosen.append(chosen_dup)
+
+                    selected_latents = np.stack(
+                        [
+                            latents_array[index_chosen[particle_index], particle_index, :, :, :]
+                            for particle_index in range(num_particles)
+                        ],
+                        axis=0,
+                    )
+                    latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
+
+                else:
+                    latents, kl_terms = ddim_step_KL(
                         self.scheduler,
                         noise_pred,
                         old_noise_pred,
@@ -1132,98 +1201,29 @@ def sample_max(
                     )
                     kl_loss += torch.mean(kl_terms)
 
-                    duplicate_model_input = (
-                        torch.cat([latents_duplicate] * 2)
-                        if do_classifier_free_guidance
-                        else latents_duplicate
-                    )
-                    duplicate_model_input = self.scheduler.scale_model_input(
-                        duplicate_model_input,
-                        timesteps[step_index + 1],
-                    )
+                if step_index == len(timesteps) - 1 or (
+                    (step_index + 1) > num_warmup_steps
+                    and (step_index + 1) % self.scheduler.order == 0
+                ):
+                    progress_bar.update()
+                    if callback is not None and step_index % callback_steps == 0:
+                        callback(step_index, t, latents)
 
-                    noise_pred_duplicate = self.unet(
-                        duplicate_model_input,
-                        timesteps[step_index + 1],
-                        encoder_hidden_states=prompt_embeds,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                    ).sample
+        if output_type == "latent":
+            image = latents
+            has_nsfw_concept = None
+        elif output_type == "pil":
+            image = self.decode_latents(latents)
+            image = self.numpy_to_pil(image)
+            has_nsfw_concept = False
+        else:
+            image = self.decode_latents(latents)
+            has_nsfw_concept = False
 
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
-                        new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    else:
-                        new_noise_pred = noise_pred_duplicate
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            self.final_offload_hook.offload()
 
-                    values = self.calculate_cvar_value(
-                            latents=latents_duplicate,
-                            new_noise_pred=new_noise_pred,
-                            t=timesteps[step_index + 1],
-                            cvar_eta=self.cvar_eta,
-                        )
+        if not return_dict:
+            return image, has_nsfw_concept
 
-                    values_list.append(values)
-                    latents_list.append(latents_duplicate.detach().cpu().numpy())
-
-                # Shapes:
-                #   log_weights_array: [duplicate, num_particles]
-                #   latents_array:     [duplicate, num_particles, C, H, W]
-                values_array = np.asarray(values_list, dtype=np.float32)
-                latents_array = np.asarray(latents_list)
-
-                index_chosen: List[int] = []
-                for particle_index in range(num_particles):
-                    values_b = values_array[:, particle_index]
-
-                    # Cost-side version of reward argmax:
-                    # reward max <=> cost/CVaR-value min.
-                    chosen_dup = int(np.argmin(values_b))
-
-                    index_chosen.append(chosen_dup)
-
-                selected_latents = np.stack(
-                    [
-                        latents_array[index_chosen[particle_index], particle_index, :, :, :]
-                        for particle_index in range(num_particles)
-                    ],
-                    axis=0,
-                )
-                latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
-
-            else:
-                latents, kl_terms = ddim_step_KL(
-                    self.scheduler,
-                    noise_pred,
-                    old_noise_pred,
-                    t,
-                    latents,
-                    eta=eta,
-                )
-                kl_loss += torch.mean(kl_terms)
-
-            if step_index == len(timesteps) - 1 or (
-                (step_index + 1) > num_warmup_steps
-                and (step_index + 1) % self.scheduler.order == 0
-            ):
-                progress_bar.update()
-                if callback is not None and step_index % callback_steps == 0:
-                    callback(step_index, t, latents)
-
-    if output_type == "latent":
-        image = latents
-        has_nsfw_concept = None
-    elif output_type == "pil":
-        image = self.decode_latents(latents)
-        image = self.numpy_to_pil(image)
-        has_nsfw_concept = False
-    else:
-        image = self.decode_latents(latents)
-        has_nsfw_concept = False
-
-    if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
-        self.final_offload_hook.offload()
-
-    if not return_dict:
-        return image, has_nsfw_concept
-
-    return image, kl_loss
+        return image, kl_loss
