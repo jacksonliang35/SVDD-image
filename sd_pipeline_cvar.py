@@ -1117,7 +1117,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                 noise_pred = old_noise_pred
 
                 if step_index < len(timesteps) - 1:
-                    log_weights_list: List[np.ndarray] = []
+                    values_list: List[np.ndarray] = []
                     latents_list: List[np.ndarray] = []
                     latent_dtype = latents.dtype
 
