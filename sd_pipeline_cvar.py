@@ -936,7 +936,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
 
     @staticmethod
     def _images_to_uint8_numpy(images: Union[np.ndarray, List[Image.Image]]) -> np.ndarray:
-        arr = CVaR_Decoding_nonbatch_SDPipeline._images_to_float_numpy(images)
+        arr = Decoding_nonbatch_SDPipeline_CVaR._images_to_float_numpy(images)
         return (arr * 255.0).round().clip(0, 255).astype("uint8")
 
     @staticmethod
