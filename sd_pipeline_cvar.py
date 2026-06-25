@@ -634,7 +634,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     negative_prompt=eval_negative_prompts,
-                    num_images_per_prompt=num_images_per_prompt,
+                    num_images_per_prompt=1,
                     eta=ddim_eta,
                     latents=init_optim,
                     output_type="pil",
