@@ -417,6 +417,303 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             self.safety_checker = old_safety_checker
 
     # ---------------------------------------------------------------------
+    # Eta solving from on-policy samples
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def estimate_eta_grad_from_on_policy_costs(
+        costs,
+        cvar_eta: float,
+        beta: float,
+        use_strict_tail: bool = False,
+    ):
+        """
+        Estimate the eta-gradient using on-policy samples.
+
+        From the notes:
+
+            d/d eta [ eta - alpha log Z_eta ]
+              = 1 - P^*_{0,eta}(c(x0) >= eta) / (1 - beta)
+
+        Since the samples here are generated on-policy using the current eta,
+        we approximate P^*_{0,eta} by the empirical distribution of these samples.
+
+        Args:
+            costs: array-like costs, where cost = -reward.
+            cvar_eta: current CVaR eta threshold.
+            beta: CVaR beta.
+            use_strict_tail: if True, use c > eta instead of c >= eta.
+
+        Returns:
+            grad, info
+        """
+        if not (0.0 <= beta < 1.0):
+            raise ValueError("beta must satisfy 0 <= beta < 1.")
+
+        costs_np = _as_numpy_1d(costs)
+        if costs_np.size == 0:
+            raise ValueError("Need at least one on-policy cost sample.")
+
+        cvar_eta = float(cvar_eta)
+        beta = float(beta)
+
+        if use_strict_tail:
+            tail_indicator = costs_np > cvar_eta
+        else:
+            tail_indicator = costs_np >= cvar_eta
+
+        tail_prob = float(np.mean(tail_indicator))
+
+        # First-order derivative:
+        #   J'(eta) = 1 - P^*(c >= eta) / (1 - beta)
+        grad = 1.0 - tail_prob / (1.0 - beta)
+
+        info = {
+            "grad": float(grad),
+            "tail_prob": tail_prob,
+            "target_tail_prob": float(1.0 - beta),
+            "eta": cvar_eta,
+            "cost_mean": float(np.mean(costs_np)),
+            "cost_std": float(np.std(costs_np)),
+            "cost_min": float(np.min(costs_np)),
+            "cost_max": float(np.max(costs_np)),
+            "num_samples": int(costs_np.size),
+        }
+
+        return float(grad), info
+
+    @torch.no_grad()
+    def optimize_cvar_eta_on_policy_warmup(
+        self,
+        prompt: Union[str, List[str]],
+        optim_bs: int = 5,
+        optim_steps: int = 20,
+        lr: float = 0.05,
+        lr_decay: float = 0.0,
+        eta_init: Optional[float] = None,
+        ddim_eta: float = 1.0,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        generator: Optional[torch.Generator] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        use_sample_max: bool = True,
+        grad_clip: Optional[float] = None,
+        eta_bounds: Optional[Tuple[float, float]] = None,
+        use_strict_tail: bool = False,
+        progress: bool = True,
+        store_history: bool = True,
+    ):
+        """
+        Warm-up optimization of cvar_eta using on-policy samples.
+
+        At each optimization step:
+            1. Set the current cvar_eta.
+            2. Sample fresh initial latents.
+            3. Generate images using the current on-policy sampler.
+            4. Score images as rewards.
+            5. Convert rewards to costs: cost = -reward.
+            6. Estimate
+
+                   grad = 1 - P_on_policy(c(x0) >= eta) / (1 - beta)
+
+            7. Update
+
+                   eta <- eta - lr_t * grad
+
+        Args:
+            prompt: prompt used for warm-up samples.
+            optim_bs: number of on-policy samples per eta update.
+            optim_steps: number of eta optimization steps.
+            lr: eta learning rate.
+            lr_decay: optional decay, lr_t = lr / (1 + lr_decay * step).
+            eta_init: initial cvar_eta. If None, uses self.cvar_eta.
+            ddim_eta: DDIM eta passed to sample_max / __call__. This is not cvar_eta.
+            use_sample_max: if True, use self.sample_max(...); otherwise use self(...).
+            grad_clip: optional absolute gradient clipping.
+            eta_bounds: optional clipping interval for eta, e.g. (-20, 20).
+            use_strict_tail: if True, use c > eta instead of c >= eta.
+            progress: whether to show tqdm progress.
+            store_history: whether to return step diagnostics.
+
+        Returns:
+            eta, info
+        """
+        self._ensure_cvar_defaults()
+        self._validate_alpha_beta(float(self.alpha), float(self.beta))
+
+        if optim_bs < 1:
+            raise ValueError("optim_bs must be at least 1.")
+        if optim_steps < 0:
+            raise ValueError("optim_steps must be nonnegative.")
+        if lr <= 0:
+            raise ValueError("lr must be positive.")
+        if lr_decay < 0:
+            raise ValueError("lr_decay must be nonnegative.")
+
+        if use_sample_max and not hasattr(self, "sample_max"):
+            raise AttributeError(
+                "use_sample_max=True, but this pipeline has no sample_max method. "
+                "Paste the CVaR sample_max method into the class first, or set "
+                "use_sample_max=False."
+            )
+
+        if eta_init is None:
+            if getattr(self, "cvar_eta", None) is None:
+                raise RuntimeError(
+                    "eta_init is None and self.cvar_eta is not set. "
+                    "Call set_cvar_eta(...), pass eta_init=..., or solve eta first."
+                )
+            eta_value = float(self.cvar_eta)
+        else:
+            eta_value = float(eta_init)
+
+        if eta_bounds is not None:
+            eta_lo, eta_hi = map(float, eta_bounds)
+            if eta_lo > eta_hi:
+                eta_lo, eta_hi = eta_hi, eta_lo
+            eta_bounds = (eta_lo, eta_hi)
+            eta_value = float(np.clip(eta_value, eta_lo, eta_hi))
+
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        device = self._execution_device
+        latent_dtype = getattr(self.unet, "dtype", torch.float32)
+
+        num_particles = int(optim_bs)
+
+        history = []
+
+        old_batch_size = getattr(self, "batch_size", None)
+
+        try:
+            # Some versions of the non-batched code use self.batch_size for
+            # indexing, so temporarily match it to the actual latent batch.
+            self.batch_size = num_particles
+
+            iterator = range(int(optim_steps))
+            if progress:
+                try:
+                    from tqdm.auto import tqdm
+                    iterator = tqdm(iterator, desc="Optimizing eta")
+                except Exception:
+                    pass
+
+            for step in iterator:
+                # Use current eta for on-policy generation.
+                self.set_cvar_eta(eta_value)
+
+                init_optim = torch.randn(
+                    (num_particles, 4, 64, 64),
+                    device=device,
+                    dtype=latent_dtype,
+                    generator=generator if isinstance(generator, torch.Generator) else None,
+                )
+
+                eval_prompts = self._make_repeated_batch(
+                    prompt,
+                    int(optim_bs),
+                    offset=step * int(optim_bs),
+                )
+
+                eval_negative_prompts = self._make_repeated_batch(
+                    negative_prompt,
+                    int(optim_bs),
+                    offset=step * int(optim_bs),
+                )
+
+                sampler = self.sample_max if use_sample_max else self.__call__
+
+                image_optim, _ = sampler(
+                    eval_prompts,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    negative_prompt=eval_negative_prompts,
+                    num_images_per_prompt=num_images_per_prompt,
+                    eta=ddim_eta,
+                    latents=init_optim,
+                    output_type="pil",
+                    return_dict=True,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    cvar_eta=eta_value,
+                )
+
+                rewards = self.reward_from_images(image_optim)
+                costs = -_as_numpy_1d(rewards)
+
+                grad_raw, step_info = self.estimate_eta_grad_from_on_policy_costs(
+                    costs=costs,
+                    cvar_eta=eta_value,
+                    beta=float(self.beta),
+                    use_strict_tail=use_strict_tail,
+                )
+
+                grad_used = float(grad_raw)
+
+                if grad_clip is not None:
+                    clip = abs(float(grad_clip))
+                    grad_used = float(np.clip(grad_used, -clip, clip))
+
+                lr_t = float(lr / (1.0 + float(lr_decay) * step))
+
+                eta_before = float(eta_value)
+                eta_after = eta_before - lr_t * grad_used
+
+                if eta_bounds is not None:
+                    eta_after = float(np.clip(eta_after, eta_bounds[0], eta_bounds[1]))
+
+                eta_value = float(eta_after)
+                self.set_cvar_eta(eta_value)
+
+                if store_history:
+                    step_info.update(
+                        {
+                            "step": int(step),
+                            "eta_before": eta_before,
+                            "eta_after": eta_after,
+                            "lr": lr_t,
+                            "grad_raw": float(grad_raw),
+                            "grad_used": float(grad_used),
+                            "reward_mean": float(np.mean(rewards)),
+                            "reward_std": float(np.std(rewards)),
+                        }
+                    )
+                    history.append(step_info)
+
+        finally:
+            self.batch_size = old_batch_size
+
+        self.set_cvar_eta(eta_value)
+
+        info = {
+            "method": "on_policy_warmup",
+            "eta": float(eta_value),
+            "alpha": float(self.alpha),
+            "beta": float(self.beta),
+            "optim_bs": int(optim_bs),
+            "optim_steps": int(optim_steps),
+            "lr": float(lr),
+            "lr_decay": float(lr_decay),
+            "ddim_eta": float(ddim_eta),
+            "use_sample_max": bool(use_sample_max),
+            "grad_clip": None if grad_clip is None else float(grad_clip),
+            "eta_bounds": eta_bounds,
+            "use_strict_tail": bool(use_strict_tail),
+        }
+
+        if store_history:
+            info["history"] = history
+
+        self.cvar_eta_info = info
+
+        return float(eta_value), info
+
+    # ---------------------------------------------------------------------
     # Reward/cost calculation
     # ---------------------------------------------------------------------
 
