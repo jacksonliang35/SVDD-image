@@ -184,6 +184,8 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             self.alpha = 10.0
         if not hasattr(self, "beta"):
             self.beta = 0.8
+        if not hasattr(self, "cvar_lambda"):
+            self.cvar_lambda = 1.0
         if not hasattr(self, "cvar_eta"):
             self.cvar_eta = None
         if not hasattr(self, "variant"):
@@ -202,6 +204,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         duplicate_size: int,
         alpha: float = 10.0,
         beta: float = 0.8,
+        cvar_lambda: float = 1.0,
         cvar_eta: Optional[float] = None,
     ) -> None:
         self._validate_alpha_beta(alpha, beta)
@@ -211,10 +214,14 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         self.duplicate = int(duplicate_size)
         self.alpha = float(alpha)
         self.beta = float(beta)
+        self.cvar_lambda = float(cvar_lambda)
         self.cvar_eta = None if cvar_eta is None else float(cvar_eta)
 
     def set_cvar_eta(self, cvar_eta: float) -> None:
         self.cvar_eta = float(cvar_eta)
+
+    def set_cvar_lambda(self, cvar_lambda: float) -> None:
+        self.cvar_lambda = float(cvar_lambda)
 
     def set_cvar_beta(self, beta: float) -> None:
         self._ensure_cvar_defaults()
@@ -895,28 +902,145 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
 
         raise ValueError("variant must be 'PM' or 'MC'.")
 
+    def calculate_weighted_value(
+        self,
+        latents: torch.FloatTensor,
+        new_noise_pred: torch.FloatTensor,
+        t: torch.Tensor,
+        cvar_eta: Optional[float] = None,
+        cvar_lambda: Optional[float] = None,
+        include_eta_constant: bool = False,
+    ) -> np.ndarray:
+        """
+        Weighted objective value for duplicate selection.
+
+        The intended objective is
+
+            (1 - lambda) * original_loss + lambda * cvar_loss.
+
+        Since rewards have been converted to costs,
+
+            original_loss = c(x0) = -reward,
+
+        and the CVaR tail part is
+
+            cvar_tail_loss = ((c(x0) - eta)^+) / (1 - beta).
+
+        Therefore, for resampling/selection we use
+
+            mixed_value =
+                (1 - lambda) * c(x0)
+                + lambda * ((c(x0) - eta)^+) / (1 - beta)
+
+        The full CVaR loss also contains +eta, so the full weighted loss is
+
+            mixed_value + lambda * eta.
+
+        But lambda * eta is constant across duplicates at a fixed step, so it
+        does not affect resampling probabilities. Use include_eta_constant=True
+        only if you want the full scalar loss for logging.
+        """
+        self._ensure_cvar_defaults()
+        self._validate_alpha_beta(float(self.alpha), float(self.beta))
+
+        if cvar_eta is None:
+            cvar_eta = self.cvar_eta
+
+        if cvar_eta is None:
+            raise RuntimeError(
+                "cvar_eta is not set. Call set_cvar_eta(...), pass cvar_eta=..., "
+                "or solve eta first."
+            )
+
+        if cvar_lambda is None:
+            cvar_lambda = self.cvar_lambda
+
+        self._validate_cvar_lambda(float(cvar_lambda))
+
+        eta_value = float(cvar_eta)
+        lam = float(cvar_lambda)
+        beta = float(self.beta)
+
+        if self.variant == "PM":
+            # PM original cost: c(E[x0 | x_t]) = -reward(E[x0 | x_t])
+            costs = self.calculate_pm_cost(
+                latents=latents,
+                new_noise_pred=new_noise_pred,
+                t=t,
+            )
+            costs = _as_numpy_1d(costs)
+
+            cvar_tail_values = np.maximum(costs - eta_value, 0.0) / (1.0 - beta)
+
+        elif self.variant == "MC":
+            # MC original cost should be estimated in the same way as the
+            # risk-neutral MC setting.
+            #
+            # This assumes you have implemented calculate_mc_cost(...), e.g.
+            # cost = -calculate_mc_reward(...).
+            if not hasattr(self, "calculate_mc_cost"):
+                raise NotImplementedError(
+                    "variant == 'MC' weighted objective requires calculate_mc_cost(...). "
+                    "Implement it using the same reward estimate as the risk-neutral MC setting."
+                )
+
+            costs = self.calculate_mc_cost(
+                latents=latents,
+                new_noise_pred=new_noise_pred,
+                t=t,
+            )
+            costs = _as_numpy_1d(costs)
+
+            cvar_tail_values = self.calculate_mc_cvar_value(
+                latents=latents,
+                new_noise_pred=new_noise_pred,
+                t=t,
+                cvar_eta=eta_value,
+            )
+            cvar_tail_values = _as_numpy_1d(cvar_tail_values)
+
+        else:
+            raise ValueError("variant must be 'PM' or 'MC'.")
+
+        mixed_values = (1.0 - lam) * costs + lam * cvar_tail_values
+
+        if include_eta_constant:
+            mixed_values = mixed_values + lam * eta_value
+
+        return _as_numpy_1d(mixed_values)
+
     def calculate_cvar_log_weight(
         self,
         latents: torch.FloatTensor,
         new_noise_pred: torch.FloatTensor,
         t: torch.Tensor,
         cvar_eta: Optional[float] = None,
+        cvar_lambda: Optional[float] = None,
     ) -> np.ndarray:
         """
-        Return log weights for resampling.
+        Return log weights for resampling under the weighted objective.
 
-        Correct sign/convention for minimization:
-            log w = - V / alpha
-                  = - ((c - eta)^+) / (alpha * (1 - beta))   in PM mode.
+        Weighted objective:
 
-        Therefore the positive quantity ((c-eta)^+) / (alpha*(1-beta)) is a
-        penalty; the sampling log-weight is its negative.
+            mixed_value =
+                (1 - lambda) * cost
+                + lambda * ((cost - eta)^+) / (1 - beta)
+
+        Resampling weight:
+
+            log w = - mixed_value / alpha
+
+        Special cases:
+            lambda = 0 -> risk-neutral original objective
+            lambda = 1 -> pure CVaR objective
         """
-        values = self.calculate_cvar_value(
+        values = self.calculate_weighted_value(
             latents=latents,
             new_noise_pred=new_noise_pred,
             t=t,
             cvar_eta=cvar_eta,
+            cvar_lambda=cvar_lambda,
+            include_eta_constant=False,
         )
         return - values / float(self.alpha)
 
@@ -1452,11 +1576,12 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                         else:
                             new_noise_pred = noise_pred_duplicate
 
-                        values = self.calculate_cvar_value(
+                        values = self.calculate_weighted_value(
                                 latents=latents_duplicate,
                                 new_noise_pred=new_noise_pred,
                                 t=timesteps[step_index + 1],
                                 cvar_eta=self.cvar_eta,
+                                cvar_lambda=self.cvar_lambda,
                             )
 
                         values_list.append(values)
