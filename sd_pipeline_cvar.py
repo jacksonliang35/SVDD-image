@@ -198,6 +198,11 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         if not (0.0 <= beta < 1.0):
             raise ValueError("beta must satisfy 0 <= beta < 1.")
 
+    @staticmethod
+    def _validate_cvar_lambda(cvar_lambda: float) -> None:
+        if not (0.0 <= float(cvar_lambda) <= 1.0):
+            raise ValueError("cvar_lambda must satisfy 0 <= cvar_lambda <= 1.")
+
     def set_parameters(
         self,
         batch_size: int,
@@ -221,6 +226,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         self.cvar_eta = float(cvar_eta)
 
     def set_cvar_lambda(self, cvar_lambda: float) -> None:
+        self._validate_cvar_lambda(cvar_lambda)
         self.cvar_lambda = float(cvar_lambda)
 
     def set_cvar_beta(self, beta: float) -> None:
