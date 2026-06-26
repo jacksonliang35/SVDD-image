@@ -1524,3 +1524,84 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             return image, has_nsfw_concept
 
         return image, kl_loss
+
+    @torch.no_grad()
+    def sample_pretrained_baseline(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        disable_safety_checker: bool = True,
+        return_reward: bool = True,
+    ):
+        """
+        Generate baseline samples from the vanilla pre-trained Stable Diffusion model.
+
+        This intentionally bypasses:
+            - CVaR resampling
+            - duplicate sampling
+            - sample_max / per-step min-cost decoding
+            - custom ddim_step_KL logic
+
+        It directly calls StableDiffusionPipeline.__call__(...).
+
+        Note:
+            eta here is DDIM eta, not CVaR eta.
+        """
+
+        old_safety_checker = getattr(self, "safety_checker", None)
+
+        if disable_safety_checker:
+            self.safety_checker = None
+
+        try:
+            output = StableDiffusionPipeline.__call__(
+                self,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                negative_prompt=negative_prompt,
+                num_images_per_prompt=num_images_per_prompt,
+                eta=eta,
+                generator=generator,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                output_type=output_type,
+                return_dict=return_dict,
+                callback=callback,
+                callback_steps=callback_steps,
+                cross_attention_kwargs=cross_attention_kwargs,
+            )
+
+        finally:
+            if disable_safety_checker:
+                self.safety_checker = old_safety_checker
+
+        if not return_reward:
+            return output
+
+        if return_dict:
+            images = output.images
+        else:
+            images = output[0]
+
+        rewards = self.reward_from_images(images)
+
+        return images, rewards
