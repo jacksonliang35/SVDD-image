@@ -84,6 +84,8 @@ end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 initial_memory = torch.cuda.memory_allocated()
 
+prompt = "a crowded street market at night with hundreds of signs, lanterns, people, food stalls, fabrics, reflections, and details."
+
 image = []
 eval_prompt_list = []
 KL_list = []
