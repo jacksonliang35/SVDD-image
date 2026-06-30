@@ -803,7 +803,6 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
     def calculate_mc_cost(
         self,
         latents: torch.FloatTensor,
-        new_noise_pred: torch.FloatTensor,
         t: torch.Tensor,
     ) -> np.ndarray:
         """
@@ -818,9 +817,6 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             reward = same MC reward estimate
             cost   = -reward
             value  = ((cost - cvar_eta)^+) / (1 - beta)
-
-        new_noise_pred is unused in MC mode, but kept in the signature so PM and
-        MC share the same calculate_cvar_value(...) interface.
         """
         if not hasattr(self, "scorer"):
             raise RuntimeError("Call setup_scorer(...) before calculate_mc_cvar_value(...).")
@@ -873,110 +869,61 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         return costs
     
     @torch.no_grad()
-    def calculate_mc_cvar_value(
+    def calculate_cost(
         self,
         latents: torch.FloatTensor,
-        new_noise_pred: torch.FloatTensor,
+        new_noise_pred: Optional[torch.FloatTensor],
         t: torch.Tensor,
-        cvar_eta: float,
     ) -> np.ndarray:
         """
-        MC-mode CVaR value estimated using the same scorer input convention as
-        the risk-neutral MC setting.
+        Variant-dispatched cost.
 
-        Risk-neutral MC logic:
-            compressibility: scorer(latents, timesteps=t)
-            aesthetic:       scorer(decoded_latent_image, timesteps=t)
+        PM:
+            cost = -reward(predicted x0)
+            requires new_noise_pred.
 
-        Here:
-            reward = same MC reward estimate
-            cost   = -reward
-            value  = ((cost - cvar_eta)^+) / (1 - beta)
-
-        new_noise_pred is unused in MC mode, but kept in the signature so PM and
-        MC share the same calculate_cvar_value(...) interface.
+        MC:
+            cost = -learned MC reward/value estimate
+            does not need new_noise_pred for the current implementation.
         """
-        
-        costs = self.calculate_mc_cost(
-            latents=latents,
-            new_noise_pred=new_noise_pred,
-            t=t,
-        )
-        excess = np.maximum(costs - float(cvar_eta), 0.0)
-        values = excess / (1.0 - float(self.beta))
-
-        return values
-
-    def calculate_cvar_value(
-        self,
-        latents: torch.FloatTensor,
-        new_noise_pred: torch.FloatTensor,
-        t: torch.Tensor,
-        cvar_eta: Optional[float] = None,
-    ) -> np.ndarray:
-        """
-        Return V_{t,eta}(x_t).  In PM mode:
-            V ~= ((c(E[x0|x_t]) - eta)^+) / (1 - beta)
-        """
-        self._ensure_cvar_defaults()
-        self._validate_alpha_beta(float(self.alpha), float(self.beta))
-        if cvar_eta is None:
-            cvar_eta = self.cvar_eta
-        if cvar_eta is None:
-            raise RuntimeError("cvar_eta is not set. Call solve_cvar_eta_from_pretrained(...) or set_cvar_eta(...).")
-
         if self.variant == "PM":
-            costs = self.calculate_pm_cost(latents=latents, new_noise_pred=new_noise_pred, t=t)
-            excess = np.maximum(costs - float(cvar_eta), 0.0)
-            return excess / (1.0 - float(self.beta))
+            if new_noise_pred is None:
+                raise ValueError("PM mode requires new_noise_pred.")
+            costs = self.calculate_pm_cost(
+                latents=latents,
+                new_noise_pred=new_noise_pred,
+                t=t,
+            )
+            return _as_numpy_1d(costs)
 
         if self.variant == "MC":
-            return self.calculate_mc_cvar_value(
-                    latents=latents,
-                    new_noise_pred=new_noise_pred,
-                    t=t,
-                    cvar_eta=float(cvar_eta),
-                )
+            costs = self.calculate_mc_cost(
+                latents=latents,
+                t=t,
+            )
+            return _as_numpy_1d(costs)
 
         raise ValueError("variant must be 'PM' or 'MC'.")
 
+    @torch.no_grad()
     def calculate_weighted_value(
         self,
         latents: torch.FloatTensor,
-        new_noise_pred: torch.FloatTensor,
+        new_noise_pred: Optional[torch.FloatTensor],
         t: torch.Tensor,
         cvar_eta: Optional[float] = None,
         cvar_lambda: Optional[float] = None,
         include_eta_constant: bool = False,
     ) -> np.ndarray:
         """
-        Weighted objective value for duplicate selection.
-
-        The intended objective is
-
-            (1 - lambda) * original_loss + lambda * cvar_loss.
-
-        Since rewards have been converted to costs,
-
-            original_loss = c(x0) = -reward,
-
-        and the CVaR tail part is
-
-            cvar_tail_loss = ((c(x0) - eta)^+) / (1 - beta).
-
-        Therefore, for resampling/selection we use
+        Weighted duplicate-selection objective:
 
             mixed_value =
-                (1 - lambda) * c(x0)
-                + lambda * ((c(x0) - eta)^+) / (1 - beta)
+                (1 - lambda) * cost
+                + lambda * ((cost - eta)^+) / (1 - beta)
 
-        The full CVaR loss also contains +eta, so the full weighted loss is
-
-            mixed_value + lambda * eta.
-
-        But lambda * eta is constant across duplicates at a fixed step, so it
-        does not affect resampling probabilities. Use include_eta_constant=True
-        only if you want the full scalar loss for logging.
+        Since +lambda * eta is constant across duplicates at one step,
+        it is excluded by default.
         """
         self._ensure_cvar_defaults()
         self._validate_alpha_beta(float(self.alpha), float(self.beta))
@@ -986,7 +933,8 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
 
         if cvar_eta is None:
             raise RuntimeError(
-                "cvar_eta is not set. Call set_cvar_eta(...), pass cvar_eta=..., "
+                "cvar_eta is not set. "
+                "Call set_cvar_eta(...), pass cvar_eta=..., "
                 "or solve eta first."
             )
 
@@ -999,53 +947,32 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         lam = float(cvar_lambda)
         beta = float(self.beta)
 
-        if self.variant == "PM":
-            # PM original cost: c(E[x0 | x_t]) = -reward(E[x0 | x_t])
-            costs = self.calculate_pm_cost(
-                latents=latents,
-                new_noise_pred=new_noise_pred,
-                t=t,
-            )
-            costs = _as_numpy_1d(costs)
+        costs = self.calculate_cost(
+            latents=latents,
+            new_noise_pred=new_noise_pred,
+            t=t,
+        )
 
-            cvar_tail_values = np.maximum(costs - eta_value, 0.0) / (1.0 - beta)
-
-        elif self.variant == "MC":
-            # MC original cost should be estimated in the same way as the
-            # risk-neutral MC setting.
-            #
-            # This assumes you have implemented calculate_mc_cost(...), e.g.
-            # cost = -calculate_mc_reward(...).
-            if not hasattr(self, "calculate_mc_cost"):
-                raise NotImplementedError(
-                    "variant == 'MC' weighted objective requires calculate_mc_cost(...). "
-                    "Implement it using the same reward estimate as the risk-neutral MC setting."
-                )
-
-            costs = self.calculate_mc_cost(
-                latents=latents,
-                new_noise_pred=new_noise_pred,
-                t=t,
-            )
-            costs = _as_numpy_1d(costs)
-
-            cvar_tail_values = self.calculate_mc_cvar_value(
-                latents=latents,
-                new_noise_pred=new_noise_pred,
-                t=t,
-                cvar_eta=eta_value,
-            )
-            cvar_tail_values = _as_numpy_1d(cvar_tail_values)
-
-        else:
-            raise ValueError("variant must be 'PM' or 'MC'.")
-
+        cvar_tail_values = np.maximum(costs - eta_value, 0.0) / (1.0 - beta)
         mixed_values = (1.0 - lam) * costs + lam * cvar_tail_values
 
         if include_eta_constant:
             mixed_values = mixed_values + lam * eta_value
 
         return _as_numpy_1d(mixed_values)
+    
+    @torch.no_grad()
+    def calculate_cvar_value(
+        self,
+        latents: torch.FloatTensor,
+        new_noise_pred: Optional[torch.FloatTensor],
+        t: torch.Tensor,
+        cvar_eta: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Return V_{t,eta}(x_t) = ((cost - eta)^+) / (1 - beta).
+        """
+        return self.calculate_weighted_value(latents, new_noise_pred, t, cvar_eta=cvar_eta, cvar_lambda=1.0, include_eta_constant=False)
 
     def calculate_cvar_log_weight(
         self,
@@ -1144,7 +1071,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
     # Main CVaR non-batched decoding call
     # ---------------------------------------------------------------------
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
@@ -1414,7 +1341,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
 
         return image, kl_loss
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample_max(
         self,
         prompt: Union[str, List[str]] = None,
@@ -1576,9 +1503,13 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                 noise_pred = old_noise_pred
 
                 if step_index < len(timesteps) - 1:
-                    values_list: List[np.ndarray] = []
-                    latents_list: List[np.ndarray] = []
-                    latent_dtype = latents.dtype
+                    # values_list: List[np.ndarray] = []
+                    # latents_list: List[np.ndarray] = []
+                    # latent_dtype = latents.dtype
+                    best_values: Optional[np.ndarray] = None
+                    best_latents: Optional[torch.FloatTensor] = None
+
+                    t_next = timesteps[step_index + 1]
 
                     for _dup_index in range(int(self.duplicate)):
                         latents_duplicate, kl_terms = ddim_step_KL(
@@ -1591,65 +1522,85 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                         )
                         kl_loss += torch.mean(kl_terms)
 
-                        duplicate_model_input = (
-                            torch.cat([latents_duplicate] * 2)
-                            if do_classifier_free_guidance
-                            else latents_duplicate
-                        )
-                        duplicate_model_input = self.scheduler.scale_model_input(
-                            duplicate_model_input,
-                            timesteps[step_index + 1],
-                        )
+                        if self.variant == "PM":
+                            duplicate_model_input = (
+                                torch.cat([latents_duplicate] * 2)
+                                if do_classifier_free_guidance
+                                else latents_duplicate
+                            )
+                            duplicate_model_input = self.scheduler.scale_model_input(
+                                duplicate_model_input,
+                                t_next,
+                            )
 
-                        noise_pred_duplicate = self.unet(
-                            duplicate_model_input,
-                            timesteps[step_index + 1],
-                            encoder_hidden_states=prompt_embeds,
-                            cross_attention_kwargs=cross_attention_kwargs,
-                        ).sample
+                            noise_pred_duplicate = self.unet(
+                                duplicate_model_input,
+                                t_next,
+                                encoder_hidden_states=prompt_embeds,
+                                cross_attention_kwargs=cross_attention_kwargs,
+                            ).sample
 
-                        if do_classifier_free_guidance:
-                            noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
-                            new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                        else:
-                            new_noise_pred = noise_pred_duplicate
+                            if do_classifier_free_guidance:
+                                noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
+                                new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                            else:
+                                new_noise_pred = noise_pred_duplicate
+                        else: # self.variant == "MC"
+                            new_noise_pred = None
 
                         values = self.calculate_weighted_value(
                                 latents=latents_duplicate,
                                 new_noise_pred=new_noise_pred,
-                                t=timesteps[step_index + 1],
+                                t=t_next,
                                 cvar_eta=self.cvar_eta,
                                 cvar_lambda=self.cvar_lambda,
                             )
 
-                        values_list.append(values)
-                        latents_list.append(latents_duplicate.detach().cpu().numpy())
+                        # values_list.append(values)
+                        # latents_list.append(latents_duplicate.detach().cpu().numpy())
 
-                    # Shapes:
-                    #   log_weights_array: [duplicate, num_particles]
-                    #   latents_array:     [duplicate, num_particles, C, H, W]
-                    values_array = np.asarray(values_list, dtype=np.float32)
-                    latents_array = np.asarray(latents_list)
+                        if best_values is None:
+                            best_values = values.copy()
+                            best_latents = latents_duplicate.detach().clone()
+                        else:
+                            better_np = values < best_values
 
-                    index_chosen: List[int] = []
-                    for particle_index in range(num_particles):
-                        values_b = values_array[:, particle_index]
+                            if np.any(better_np):
+                                better_torch = torch.as_tensor(
+                                    better_np,
+                                    device=latents_duplicate.device,
+                                    dtype=torch.bool,
+                                )
 
-                        # Cost-side version of reward argmax:
-                        # reward max <=> cost/CVaR-value min.
-                        chosen_dup = int(np.argmin(values_b))
+                                best_values[better_np] = values[better_np]
+                                best_latents[better_torch] = latents_duplicate.detach()[better_torch]
 
-                        index_chosen.append(chosen_dup)
+                    # # Shapes:
+                    # #   log_weights_array: [duplicate, num_particles]
+                    # #   latents_array:     [duplicate, num_particles, C, H, W]
+                    # values_array = np.asarray(values_list, dtype=np.float32)
+                    # latents_array = np.asarray(latents_list)
 
-                    selected_latents = np.stack(
-                        [
-                            latents_array[index_chosen[particle_index], particle_index, :, :, :]
-                            for particle_index in range(num_particles)
-                        ],
-                        axis=0,
-                    )
-                    latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
-                    print(latents.shape, latents.dtype, latents.device)
+                    # index_chosen: List[int] = []
+                    # for particle_index in range(num_particles):
+                    #     values_b = values_array[:, particle_index]
+
+                    #     # Cost-side version of reward argmax:
+                    #     # reward max <=> cost/CVaR-value min.
+                    #     chosen_dup = int(np.argmin(values_b))
+
+                    #     index_chosen.append(chosen_dup)
+
+                    # selected_latents = np.stack(
+                    #     [
+                    #         latents_array[index_chosen[particle_index], particle_index, :, :, :]
+                    #         for particle_index in range(num_particles)
+                    #     ],
+                    #     axis=0,
+                    # )
+                    # latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
+                    
+                    latents = best_latents
 
                 else:
                     latents, kl_terms = ddim_step_KL(
@@ -1688,8 +1639,109 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             return image, has_nsfw_concept
 
         return image, kl_loss
+    
+    @torch.inference_mode()
+    def sample_risk_neutral_baseline(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        use_sample_max: bool = True,
+        risk_neutral_alpha: Optional[float] = None,
+    ):
+        """
+        Generate a risk-neutral SVDD baseline using the CVaR sampler with
+        the special parameter choice cvar_lambda = 0.
 
-    @torch.no_grad()
+        Risk-neutral special case:
+            mixed_value
+                = (1 - lambda) * cost
+                + lambda * ((cost - cvar_eta)^+) / (1 - beta)
+
+            with lambda = 0:
+
+            mixed_value = cost = -reward
+
+        Therefore:
+            use_sample_max=True:
+                selects argmin(cost), equivalently argmax(reward).
+
+            use_sample_max=False:
+                samples with log_weight = -cost / alpha = reward / alpha,
+                matching the original risk-neutral softmax weighting.
+
+        Notes:
+            - cvar_eta is set to 0.0 only as a dummy value. It has no effect
+            when cvar_lambda = 0.
+            - beta also has no effect when cvar_lambda = 0, but it must still
+            be valid because the shared CVaR code validates it.
+            - risk_neutral_alpha only matters for use_sample_max=False.
+            For sample_max, alpha does not affect argmin(cost).
+        """
+        self._ensure_cvar_defaults()
+
+        if risk_neutral_alpha is not None and float(risk_neutral_alpha) <= 0.0:
+            raise ValueError("risk_neutral_alpha must be positive.")
+
+        old_cvar_lambda = self.cvar_lambda
+        old_cvar_eta = self.cvar_eta
+        old_alpha = self.alpha
+
+        try:
+            # The risk-neutral special case.
+            self.cvar_lambda = 0.0
+
+            # Dummy value required by the current shared CVaR code path.
+            # It is mathematically irrelevant when cvar_lambda == 0.
+            self.cvar_eta = 0.0
+
+            if risk_neutral_alpha is not None:
+                self.alpha = float(risk_neutral_alpha)
+
+            sampler = self.sample_max if use_sample_max else self.__call__
+
+            return sampler(
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                negative_prompt=negative_prompt,
+                num_images_per_prompt=num_images_per_prompt,
+                eta=eta,
+                generator=generator,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                output_type=output_type,
+                return_dict=return_dict,
+                callback=callback,
+                callback_steps=callback_steps,
+                cross_attention_kwargs=cross_attention_kwargs,
+                cvar_eta=0.0,
+                auto_solve_cvar_eta=False,
+            )
+
+        finally:
+            self.cvar_lambda = old_cvar_lambda
+            self.cvar_eta = old_cvar_eta
+            self.alpha = old_alpha
+
+    @torch.inference_mode()
     def sample_pretrained_baseline(
         self,
         prompt: Union[str, List[str]] = None,
