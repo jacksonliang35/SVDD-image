@@ -800,12 +800,11 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         return -rewards
 
     @torch.no_grad()
-    def calculate_mc_cvar_value(
+    def calculate_mc_cost(
         self,
         latents: torch.FloatTensor,
         new_noise_pred: torch.FloatTensor,
         t: torch.Tensor,
-        cvar_eta: float,
     ) -> np.ndarray:
         """
         MC-mode CVaR value estimated using the same scorer input convention as
@@ -870,6 +869,39 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             raise ValueError("Invalid reward type. Expected 'compressibility' or 'aesthetic'.")
 
         costs = -_as_numpy_1d(rewards)
+
+        return costs
+    
+    @torch.no_grad()
+    def calculate_mc_cvar_value(
+        self,
+        latents: torch.FloatTensor,
+        new_noise_pred: torch.FloatTensor,
+        t: torch.Tensor,
+        cvar_eta: float,
+    ) -> np.ndarray:
+        """
+        MC-mode CVaR value estimated using the same scorer input convention as
+        the risk-neutral MC setting.
+
+        Risk-neutral MC logic:
+            compressibility: scorer(latents, timesteps=t)
+            aesthetic:       scorer(decoded_latent_image, timesteps=t)
+
+        Here:
+            reward = same MC reward estimate
+            cost   = -reward
+            value  = ((cost - cvar_eta)^+) / (1 - beta)
+
+        new_noise_pred is unused in MC mode, but kept in the signature so PM and
+        MC share the same calculate_cvar_value(...) interface.
+        """
+        
+        costs = self.calculate_mc_cost(
+            latents=latents,
+            new_noise_pred=new_noise_pred,
+            t=t,
+        )
         excess = np.maximum(costs - float(cvar_eta), 0.0)
         values = excess / (1.0 - float(self.beta))
 
@@ -1617,6 +1649,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                         axis=0,
                     )
                     latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
+                    print(latents.shape, latents.dtype, latents.device)
 
                 else:
                     latents, kl_terms = ddim_step_KL(
