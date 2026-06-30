@@ -1635,6 +1635,12 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
 
+        del latents_duplicate
+        del latents
+        del kl_terms
+        del noise_pred
+        del old_noise_pred
+
         if not return_dict:
             return image, has_nsfw_concept
 
