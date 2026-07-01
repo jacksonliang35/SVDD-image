@@ -115,7 +115,7 @@ class AestheticScorerDiff_Time(torch.nn.Module):
         self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         # self.mlp = torch.load('aes_model/reward_predictor_epoch_3.pth')
         # self.mlp = torch.load('aes_model/reward_predictor_epoch_5_iter_4000.pth')
-        self.mlp = torch.load('aes_model/reward_predictor_epoch_9.pth')
+        self.mlp = torch.load('aes_model/reward_predictor_epoch_9.pth', weights_only=False)
         self.dtype = dtype
         self.eval()
     
