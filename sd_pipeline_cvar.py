@@ -18,7 +18,7 @@ For PM mode, no value-network training is needed:
     log weight = - V_eta(x_t) / alpha
                = - ((cost - cvar_eta)^+) / (alpha * (1 - beta))
 
-MC mode is left as a TODO hook for a trained value/log-weight model.
+MC mode is for a trained value/log-weight model.
 """
 
 from contextlib import contextmanager
@@ -52,6 +52,16 @@ def logmeanexp(log_values: np.ndarray) -> float:
     m = np.max(log_values)
     return float(m + np.log(np.mean(np.exp(log_values - m))))
 
+def _sample_gumbel_np(shape, dtype=np.float32) -> np.ndarray:
+    """
+    Sample standard Gumbel noise.
+
+    Used for exact categorical sampling:
+        argmax_i(log_weight_i + gumbel_i)
+    """
+    u = np.random.random(shape).astype(dtype)
+    u = np.clip(u, 1e-6, 1.0 - 1e-6)
+    return -np.log(-np.log(u))
 
 def cvar_eta_time0_objective(
     eta_value: float,
@@ -977,7 +987,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
     def calculate_cvar_log_weight(
         self,
         latents: torch.FloatTensor,
-        new_noise_pred: torch.FloatTensor,
+        new_noise_pred: Optional[torch.FloatTensor],
         t: torch.Tensor,
         cvar_eta: Optional[float] = None,
         cvar_lambda: Optional[float] = None,
@@ -1233,9 +1243,10 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                 noise_pred = old_noise_pred
 
                 if step_index < len(timesteps) - 1:
-                    log_weights_list: List[np.ndarray] = []
-                    latents_list: List[np.ndarray] = []
-                    latent_dtype = latents.dtype
+                    best_gumbel_scores: Optional[np.ndarray] = None
+                    best_latents: Optional[torch.FloatTensor] = None
+
+                    t_next = timesteps[step_index + 1]
 
                     for _dup_index in range(int(self.duplicate)):
                         latents_duplicate, kl_terms = ddim_step_KL(
@@ -1248,60 +1259,81 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                         )
                         kl_loss += torch.mean(kl_terms)
 
-                        duplicate_model_input = (
-                            torch.cat([latents_duplicate] * 2)
-                            if do_classifier_free_guidance
-                            else latents_duplicate
-                        )
-                        duplicate_model_input = self.scheduler.scale_model_input(
-                            duplicate_model_input,
-                            timesteps[step_index + 1],
-                        )
+                        if self.variant == "PM":
+                            duplicate_model_input = (
+                                torch.cat([latents_duplicate] * 2)
+                                if do_classifier_free_guidance
+                                else latents_duplicate
+                            )
+                            duplicate_model_input = self.scheduler.scale_model_input(
+                                duplicate_model_input,
+                                t_next,
+                            )
 
-                        noise_pred_duplicate = self.unet(
-                            duplicate_model_input,
-                            timesteps[step_index + 1],
-                            encoder_hidden_states=prompt_embeds,
-                            cross_attention_kwargs=cross_attention_kwargs,
-                        ).sample
+                            noise_pred_duplicate = self.unet(
+                                duplicate_model_input,
+                                t_next,
+                                encoder_hidden_states=prompt_embeds,
+                                cross_attention_kwargs=cross_attention_kwargs,
+                            ).sample
 
-                        if do_classifier_free_guidance:
-                            noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
-                            new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                        else:
-                            new_noise_pred = noise_pred_duplicate
+                            if do_classifier_free_guidance:
+                                noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
+                                new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                            else:
+                                new_noise_pred = noise_pred_duplicate
+                        else: # self.variant == "MC"
+                            new_noise_pred = None
 
                         log_weights = self.calculate_cvar_log_weight(
                             latents=latents_duplicate,
                             new_noise_pred=new_noise_pred,
-                            t=timesteps[step_index + 1],
+                            t=t_next,
                             cvar_eta=self.cvar_eta,
+                            cvar_lambda=self.cvar_lambda,
                         )
 
-                        log_weights_list.append(log_weights)
-                        latents_list.append(latents_duplicate.detach().cpu().numpy())
+                        gumbel_noise = _sample_gumbel_np(log_weights.shape, dtype=log_weights.dtype)
+                        gumbel_scores = log_weights + gumbel_noise
 
-                    # Shapes:
-                    #   log_weights_array: [duplicate, num_particles]
-                    #   latents_array:     [duplicate, num_particles, C, H, W]
-                    log_weights_array = np.asarray(log_weights_list, dtype=np.float32)
-                    latents_array = np.asarray(latents_list)
+                        if best_gumbel_scores is None:
+                            best_gumbel_scores = gumbel_scores.copy()
+                            best_latents = latents_duplicate.detach().clone()
+                        else:
+                            better_np = gumbel_scores > best_gumbel_scores
 
-                    index_chosen: List[int] = []
-                    for particle_index in range(num_particles):
-                        logw = log_weights_array[:, particle_index]
-                        probs = self.log_weights_to_probs(logw)
-                        chosen_dup = int(np.random.choice(int(self.duplicate), p=probs))
-                        index_chosen.append(chosen_dup)
+                            if np.any(better_np):
+                                better_torch = torch.as_tensor(
+                                    better_np,
+                                    device=latents_duplicate.device,
+                                    dtype=torch.bool,
+                                )
 
-                    selected_latents = np.stack(
-                        [
-                            latents_array[index_chosen[particle_index], particle_index, :, :, :]
-                            for particle_index in range(num_particles)
-                        ],
-                        axis=0,
-                    )
-                    latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
+                                best_gumbel_scores[better_np] = gumbel_scores[better_np]
+                                best_latents[better_torch] = latents_duplicate.detach()[better_torch]
+
+                    # # Shapes:
+                    # #   log_weights_array: [duplicate, num_particles]
+                    # #   latents_array:     [duplicate, num_particles, C, H, W]
+                    # log_weights_array = np.asarray(log_weights_list, dtype=np.float32)
+                    # latents_array = np.asarray(latents_list)
+
+                    # index_chosen: List[int] = []
+                    # for particle_index in range(num_particles):
+                    #     logw = log_weights_array[:, particle_index]
+                    #     probs = self.log_weights_to_probs(logw)
+                    #     chosen_dup = int(np.random.choice(int(self.duplicate), p=probs))
+                    #     index_chosen.append(chosen_dup)
+
+                    # selected_latents = np.stack(
+                    #     [
+                    #         latents_array[index_chosen[particle_index], particle_index, :, :, :]
+                    #         for particle_index in range(num_particles)
+                    #     ],
+                    #     axis=0,
+                    # )
+                    # latents = torch.from_numpy(selected_latents).to(device=device, dtype=latent_dtype)
+                    latents = best_latents
 
                 else:
                     latents, kl_terms = ddim_step_KL(
@@ -1335,6 +1367,12 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
 
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
+        
+        del latents_duplicate
+        del latents
+        del kl_terms
+        del noise_pred
+        del old_noise_pred
 
         if not return_dict:
             return image, has_nsfw_concept
@@ -1666,7 +1704,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        use_sample_max: bool = True,
+        use_sample_max: bool = False,
         risk_neutral_alpha: Optional[float] = None,
     ):
         """
