@@ -1685,6 +1685,415 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         return image, kl_loss
     
     @torch.inference_mode()
+    def sample_smc(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        cvar_eta: Optional[float] = None,
+        auto_solve_cvar_eta: bool = False,
+        pretrained_costs: Optional[ArrayLike] = None,
+        num_pretrained_samples: int = 64,
+        pretrained_batch_size: Optional[int] = None,
+        eta_grid_size: int = 2001,
+    ):
+        """
+        Sequential Monte Carlo sampling for Decoding_nonbatch_SDPipeline_CVaR.
+
+        This is the CVaR analogue of SMC_SDPipeline in sd_pipeline.py.
+
+        Difference from __call__ / sample_max:
+            __call__ / sample_max:
+                for each particle, generate duplicate candidates and select/resample
+                within that particle's duplicate set.
+
+            sample_smc:
+                propagate every particle once, compute incremental SMC weights,
+                then resample the whole particle population globally.
+
+        Incremental SMC weight:
+            log_w_increment = log_potential(new_state) - log_potential(old_state)
+
+        where:
+            log_potential(x_t) = - mixed_value(x_t) / alpha
+
+        and:
+            mixed_value =
+                (1 - cvar_lambda) * cost
+                + cvar_lambda * ((cost - cvar_eta)^+) / (1 - beta)
+
+        Risk-neutral special case:
+            cvar_lambda = 0
+            mixed_value = cost = -reward
+
+            log_w_increment
+                = -cost_new / alpha - (-cost_old / alpha)
+                = (reward_new - reward_old) / alpha
+
+        That recovers the original SMC weighting rule.
+        """
+        self._ensure_cvar_defaults()
+        self._validate_alpha_beta(float(self.alpha), float(self.beta))
+        self._validate_cvar_lambda(float(self.cvar_lambda))
+
+        # 0. Default height and width.
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs.
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            callback_steps,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+        )
+
+        # Optional CVaR eta setup.
+        if cvar_eta is not None:
+            self.cvar_eta = float(cvar_eta)
+        elif auto_solve_cvar_eta:
+            if pretrained_costs is not None:
+                self.solve_cvar_eta_from_costs(
+                    pretrained_costs,
+                    grid_size=eta_grid_size,
+                )
+            else:
+                if prompt is None:
+                    raise ValueError(
+                        "auto_solve_cvar_eta=True with no pretrained_costs "
+                        "requires prompt, not only prompt_embeds."
+                    )
+
+                self.solve_cvar_eta_from_pretrained(
+                    prompt=prompt,
+                    num_pretrained_samples=num_pretrained_samples,
+                    pretrained_batch_size=pretrained_batch_size,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    negative_prompt=negative_prompt,
+                    generator=generator,
+                    grid_size=eta_grid_size,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
+
+        # For the risk-neutral case, eta is mathematically irrelevant, but the
+        # shared calculate_weighted_value path currently expects it to be set.
+        if self.cvar_eta is None:
+            if float(self.cvar_lambda) == 0.0:
+                self.cvar_eta = 0.0
+            else:
+                raise RuntimeError(
+                    "cvar_eta is not set. "
+                    "Call set_cvar_eta(...), pass cvar_eta=..., "
+                    "solve eta first, or set cvar_lambda=0 for risk-neutral SMC."
+                )
+
+        # 2. Define call parameters.
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode prompt.
+        prompt_embeds = self._encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+        )
+
+        # 4. Prepare timesteps.
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 5. Prepare latents.
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        num_particles = int(latents.shape[0])
+
+        # Keep this for consistency with the rest of the pipeline, even though
+        # ddim_step_KL consumes eta directly below.
+        _ = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 6. Denoising loop.
+        kl_loss = torch.zeros((), device=device, dtype=torch.float32)
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        smc_log_weights = np.zeros(num_particles, dtype=np.float32)
+        ess_history = []
+        resampled_history = []
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for step_index, t in enumerate(timesteps):
+                # Main UNet prediction at current particle states.
+                latent_model_input = (
+                    torch.cat([latents] * 2)
+                    if do_classifier_free_guidance
+                    else latents
+                )
+                latent_model_input = self.scheduler.scale_model_input(
+                    latent_model_input,
+                    t,
+                )
+
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                ).sample
+
+                if do_classifier_free_guidance:
+                    noise_pred_uncond_main, noise_pred_text_main = noise_pred.chunk(2)
+                    old_noise_pred = noise_pred_uncond_main + guidance_scale * (
+                        noise_pred_text_main - noise_pred_uncond_main
+                    )
+                else:
+                    old_noise_pred = noise_pred
+
+                # The KL step uses the guided noise prediction.
+                noise_pred = old_noise_pred
+
+                if step_index < len(timesteps) - 1:
+                    t_next = timesteps[step_index + 1]
+
+                    # ----------------------------------------------------------
+                    # Old-state log potential.
+                    # ----------------------------------------------------------
+                    # PM needs old_noise_pred to form predicted x0.
+                    # MC ignores new_noise_pred and scores latents directly.
+                    if self.variant == "PM":
+                        old_value_noise_pred = old_noise_pred
+                    elif self.variant == "MC":
+                        old_value_noise_pred = None
+                    else:
+                        raise ValueError("variant must be 'PM' or 'MC'.")
+
+                    old_log_weights = self.calculate_cvar_log_weight(
+                        latents=latents,
+                        new_noise_pred=old_value_noise_pred,
+                        t=t,
+                        cvar_eta=self.cvar_eta,
+                        cvar_lambda=self.cvar_lambda,
+                    )
+
+                    # ----------------------------------------------------------
+                    # Propagate each particle once.
+                    # ----------------------------------------------------------
+                    latents_candidate, kl_terms = ddim_step_KL(
+                        self.scheduler,
+                        noise_pred,
+                        old_noise_pred,
+                        t,
+                        latents,
+                        eta=eta,
+                    )
+
+                    kl_loss = kl_loss + torch.mean(kl_terms)
+
+                    # ----------------------------------------------------------
+                    # New-state log potential.
+                    # ----------------------------------------------------------
+                    if self.variant == "PM":
+                        # PM needs next-step UNet prediction for predicted x0.
+                        next_model_input = (
+                            torch.cat([latents_candidate] * 2)
+                            if do_classifier_free_guidance
+                            else latents_candidate
+                        )
+                        next_model_input = self.scheduler.scale_model_input(
+                            next_model_input,
+                            t_next,
+                        )
+
+                        next_noise_pred_raw = self.unet(
+                            next_model_input,
+                            t_next,
+                            encoder_hidden_states=prompt_embeds,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                        ).sample
+
+                        if do_classifier_free_guidance:
+                            next_noise_uncond, next_noise_text = next_noise_pred_raw.chunk(2)
+                            next_value_noise_pred = next_noise_uncond + guidance_scale * (
+                                next_noise_text - next_noise_uncond
+                            )
+                        else:
+                            next_value_noise_pred = next_noise_pred_raw
+
+                    else:
+                        # MC calculate_cost(...) ignores new_noise_pred.
+                        next_value_noise_pred = None
+
+                    new_log_weights = self.calculate_cvar_log_weight(
+                        latents=latents_candidate,
+                        new_noise_pred=next_value_noise_pred,
+                        t=t_next,
+                        cvar_eta=self.cvar_eta,
+                        cvar_lambda=self.cvar_lambda,
+                    )
+
+                    # ----------------------------------------------------------
+                    # SMC incremental weights and global resampling.
+                    # ----------------------------------------------------------
+                    incremental_log_weights = new_log_weights - old_log_weights
+
+                    # Accumulate SMC log weights if we do not resample every step.
+                    smc_log_weights = smc_log_weights + incremental_log_weights.astype(np.float32)
+
+                    # Normalize accumulated weights.
+                    probs = self.log_weights_to_probs(smc_log_weights)
+
+                    # Effective sample size.
+                    ess = float(1.0 / np.sum(probs**2)) # since probs is already normalized
+                    ess_history.append(ess)
+                    resample_now = ess < .5 * float(num_particles)
+
+                    if resample_now:
+                        ancestor_indices_np = np.random.choice(
+                            num_particles,
+                            size=num_particles,
+                            replace=True,
+                            p=probs,
+                        )
+
+                        ancestor_indices = torch.as_tensor(
+                            ancestor_indices_np,
+                            device=device,
+                            dtype=torch.long,
+                        )
+
+                        latents = latents_candidate.index_select(0, ancestor_indices).detach()
+
+                         # After resampling, particles are equally weighted again.
+                        smc_log_weights = np.zeros(num_particles, dtype=np.float32)
+                    
+                    else:
+                        latents = latents_candidate.detach()
+                    
+                    resampled_history.append(bool(resample_now))
+
+                else:
+                    # Last step: propagate without resampling, matching the original
+                    # SMC structure.
+                    latents, kl_terms = ddim_step_KL(
+                        self.scheduler,
+                        noise_pred,
+                        old_noise_pred,
+                        t,
+                        latents,
+                        eta=eta,
+                    )
+                    kl_loss = kl_loss + torch.mean(kl_terms)
+                    del kl_terms
+                
+                # Final resampling at the end of the denoising loop, if needed, to ensure uniform weights.
+                final_probs = self.log_weights_to_probs(smc_log_weights)
+                final_ess = float(1.0 / np.sum(final_probs**2))
+                ess_history.append(final_ess)
+
+                ## If weights are not uniform, resample once before returning images.
+                if not np.allclose(final_probs, np.ones(num_particles) / num_particles):
+                    final_indices_np = np.random.choice(
+                        num_particles,
+                        size=num_particles,
+                        replace=True,
+                        p=final_probs,
+                    )
+
+                    final_indices = torch.as_tensor(
+                        final_indices_np,
+                        device=device,
+                        dtype=torch.long,
+                    )
+
+                    latents = latents.index_select(0, final_indices).detach()
+                    smc_log_weights = np.zeros(num_particles, dtype=np.float32)
+
+                    del final_indices_np
+                    del final_indices
+
+                # Free step-local UNet tensors.
+                del latent_model_input
+                del noise_pred
+                del old_noise_pred
+
+                # Progress / callback.
+                if step_index == len(timesteps) - 1 or (
+                    (step_index + 1) > num_warmup_steps
+                    and (step_index + 1) % self.scheduler.order == 0
+                ):
+                    progress_bar.update()
+
+                    if callback is not None and step_index % callback_steps == 0:
+                        callback(step_index, t, latents)
+
+        min_normalized_ess = float(np.min(ess_history)) / float(num_particles)
+
+        # 7. Post-processing.
+        if output_type == "latent":
+            image = latents
+            has_nsfw_concept = None
+
+        elif output_type == "pil":
+            image = self.decode_latents(latents)
+            del latents
+
+            image = self.numpy_to_pil(image)
+            has_nsfw_concept = False
+
+        else:
+            image = self.decode_latents(latents)
+            del latents
+
+            has_nsfw_concept = False
+
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            self.final_offload_hook.offload()
+
+        if not return_dict:
+            return image, has_nsfw_concept
+
+        return image, kl_loss, min_normalized_ess
+    
+    @torch.inference_mode()
     def sample_risk_neutral_baseline(
         self,
         prompt: Union[str, List[str]] = None,
@@ -1704,11 +2113,16 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        use_sample_max: bool = False,
         risk_neutral_alpha: Optional[float] = None,
+        
+        #   None         -> self.__call__
+        #   "call"       -> self.__call__
+        #   "sample_max" -> self.sample_max
+        #   "smc"        -> self.sample_smc
+        sampler: Optional[str] = None,
     ):
         """
-        Generate a risk-neutral SVDD baseline using the CVaR sampler with
+        Generate a risk-neutral SVDD/SMC baseline using the CVaR sampler with
         the special parameter choice cvar_lambda = 0.
 
         Risk-neutral special case:
@@ -1721,25 +2135,49 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             mixed_value = cost = -reward
 
         Therefore:
-            use_sample_max=True:
-                selects argmin(cost), equivalently argmax(reward).
 
-            use_sample_max=False:
-                samples with log_weight = -cost / alpha = reward / alpha,
-                matching the original risk-neutral softmax weighting.
+        sampler="call":
+            stochastic duplicate sampling with log_weight = reward / alpha.
+
+        sampler="sample_max":
+            greedy duplicate selection by argmin(cost), equivalently argmax(reward).
+
+        sampler="smc":
+            risk-neutral SMC. Its incremental log weight becomes
+
+                (reward_new - reward_old) / alpha,
+
+            matching the original SMC baseline logic.
 
         Notes:
             - cvar_eta is set to 0.0 only as a dummy value. It has no effect
             when cvar_lambda = 0.
             - beta also has no effect when cvar_lambda = 0, but it must still
             be valid because the shared CVaR code validates it.
-            - risk_neutral_alpha only matters for use_sample_max=False.
-            For sample_max, alpha does not affect argmin(cost).
+            - risk_neutral_alpha affects sampler="call" and sampler="smc".
+            It does not affect sampler="sample_max".
         """
         self._ensure_cvar_defaults()
 
         if risk_neutral_alpha is not None and float(risk_neutral_alpha) <= 0.0:
             raise ValueError("risk_neutral_alpha must be positive.")
+
+        sampler = "call" if sampler is None else str(sampler).lower()
+
+        if sampler in {"call", "__call__"}:
+            sampler_fn = self.__call__
+
+        elif sampler == "sample_max":
+            sampler_fn = self.sample_max
+
+        elif sampler == "smc":
+            sampler_fn = self.sample_smc
+
+        else:
+            raise ValueError(
+                "Invalid sampler. Expected one of: "
+                "'call', 'sample_max', or 'smc'."
+            )
 
         old_cvar_lambda = self.cvar_lambda
         old_cvar_eta = self.cvar_eta
@@ -1756,9 +2194,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             if risk_neutral_alpha is not None:
                 self.alpha = float(risk_neutral_alpha)
 
-            sampler = self.sample_max if use_sample_max else self.__call__
-
-            return sampler(
+            return sampler_fn(
                 prompt=prompt,
                 height=height,
                 width=width,
