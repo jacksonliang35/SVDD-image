@@ -676,7 +676,7 @@ def score_final_costs(
     return -rewards.reshape(-1).float()
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_prompt_features(
     pipe: Decoding_nonbatch_SDPipeline_CVaR,
     prompts: Sequence[str],
@@ -809,7 +809,7 @@ def rollout_pretrained_batch(
     return recorded_states, final_costs
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def latent_state_to_clip_embed(
     pipe: Decoding_nonbatch_SDPipeline_CVaR,
     aesthetic_oracle: AestheticScorerDiff,
@@ -820,7 +820,7 @@ def latent_state_to_clip_embed(
     images_clip = clip_preprocess_tensor(images_01.float()).to(device=latents.device, dtype=oracle_dtype)
     embed = aesthetic_oracle.clip.get_image_features(pixel_values=images_clip)
     embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
-    return embed.detach().float()
+    return embed.detach().clone().float()
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1114,10 @@ def train(cfg: TrainConfig) -> None:
         group_ids = group_ids_cpu.to(device=device)
 
         prompt_features_p = encode_prompt_features(pipe, prompt_groups, device=device)
+        prompt_features_p = prompt_features_p.detach().clone().to(
+            device=device,
+            dtype=torch.float32,
+        )
         if prompt_features_p.shape[1] != cfg.prompt_dim:
             raise ValueError(
                 f"Prompt feature dimension is {prompt_features_p.shape[1]}, but cfg.prompt_dim={cfg.prompt_dim}. "
@@ -1129,7 +1133,7 @@ def train(cfg: TrainConfig) -> None:
             negative_prompts=negative_prompts,
             generator=generator,
         )
-        final_costs = final_costs.to(device=device, dtype=torch.float32)
+        final_costs = final_costs.detach().clone().to(device=device, dtype=torch.float32)
         costs_pk = final_costs.reshape(cfg.num_prompt_groups, cfg.samples_per_prompt)
 
         optimizer.zero_grad(set_to_none=True)
