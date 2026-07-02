@@ -114,6 +114,8 @@ class TrainConfig:
     value_lr: float = 0.1
     weight_decay: float = 0.0
     grad_clip: Optional[float] = 1.0
+
+    eta_init: float = 100.0
     eta_min: Optional[float] = 0.
     eta_max: Optional[float] = 200.
 
@@ -192,6 +194,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--value_lr", type=float, default=TrainConfig.value_lr)
     parser.add_argument("--weight_decay", type=float, default=TrainConfig.weight_decay)
     parser.add_argument("--grad_clip", type=float, default=TrainConfig.grad_clip)
+    parser.add_argument("--eta_init", type=float, default=TrainConfig.eta_init)
     parser.add_argument("--eta_min", type=float, default=None)
     parser.add_argument("--eta_max", type=float, default=None)
 
@@ -257,6 +260,7 @@ def parse_args() -> TrainConfig:
         value_lr=args.value_lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
+        eta_init=args.eta_init,
         eta_min=args.eta_min,
         eta_max=args.eta_max,
         target_type=args.target_type,
@@ -393,14 +397,17 @@ class PromptEtaNet(nn.Module):
         self,
         prompt_dim: int = 768,
         hidden_dim: int = 256,
+        eta_init: float = 100.0,
         eta_min: Optional[float] = None,
         eta_max: Optional[float] = None,
     ):
         super().__init__()
         self.prompt_dim = int(prompt_dim)
         self.hidden_dim = int(hidden_dim)
+        self.eta_init = float(eta_init)
         self.eta_min = None if eta_min is None else float(eta_min)
         self.eta_max = None if eta_max is None else float(eta_max)
+
         if (self.eta_min is None) != (self.eta_max is None):
             raise ValueError("eta_min and eta_max must be both None or both set")
         if self.eta_min is not None and self.eta_min >= self.eta_max:
@@ -414,6 +421,30 @@ class PromptEtaNet(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
         )
+
+        self.reset_eta_initialization(self.eta_init)
+    
+    def reset_eta_initialization(self, eta_init: float) -> None:
+        eta_init = float(eta_init)
+        last = self.net[-1]
+        if not isinstance(last, nn.Linear):
+            raise TypeError("Expected final eta layer to be nn.Linear")
+
+        nn.init.zeros_(last.weight)
+
+        if self.eta_min is None:
+            bias_value = eta_init
+        else:
+            if not (self.eta_min < eta_init < self.eta_max):
+                raise ValueError(
+                    f"eta_init={eta_init} must be strictly between "
+                    f"eta_min={self.eta_min} and eta_max={self.eta_max}."
+                )
+            p = (eta_init - self.eta_min) / (self.eta_max - self.eta_min)
+            bias_value = math.log(p / (1.0 - p))
+
+        with torch.no_grad():
+            last.bias.fill_(bias_value)
 
     def forward(self, prompt_embed: torch.Tensor) -> torch.Tensor:
         raw = self.net(prompt_embed.float()).squeeze(-1)
@@ -900,6 +931,7 @@ def build_trainable_models(cfg: TrainConfig, device: torch.device) -> Tuple[Prom
     eta_net = PromptEtaNet(
         prompt_dim=cfg.prompt_dim,
         hidden_dim=max(128, cfg.hidden_dim // 2),
+        eta_init=cfg.eta_init,
         eta_min=cfg.eta_min,
         eta_max=cfg.eta_max,
     ).to(device=device, dtype=torch.float32)
