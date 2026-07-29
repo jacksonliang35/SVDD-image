@@ -17,17 +17,17 @@ from sd_pipeline_cvar import Decoding_nonbatch_SDPipeline_CVaR
 
 
 args = {
-    "device": "cuda:0",
-    "reward": "compressibility",
-    "num_images": 1000,
+    "device": "cuda:3",
+    "reward": "aesthetic",
+    "num_images": 500,
     "bs": 10,
     "val_bs": 10,
-    "seed": 10938,
+    "seed": 10736,
     # "duplicate_size": 20,
     "alpha": 10,
     "cvar_beta": 0.8,
-    "cvar_lambda": 0.95,
-    "cvar_eta": 120.,
+    "cvar_lambda": 0.2,
+    "cvar_eta": -5.5,
     "variant": "MC"
 }
 args = SimpleNamespace(**args)
@@ -85,7 +85,19 @@ end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 initial_memory = torch.cuda.memory_allocated()
 
-prompt = "a crowded street market at night with hundreds of signs, lanterns, people, food stalls, fabrics, reflections, and details."
+# prompt = "a crowded street market at night with hundreds of signs, lanterns, people, food stalls, fabrics, reflections, and details."
+
+prompt = "monkey"
+
+# LAMBDA = [0.1, 0.2, 0.3]
+# ETA = [100., 105., 110., 115.]
+
+# for cvar_lambda in LAMBDA:
+#     for cvar_eta in ETA:
+#         print(f"Running with cvar_lambda={cvar_lambda}, cvar_eta={cvar_eta}")
+
+        # sd_model.set_cvar_lambda(cvar_lambda)
+        # sd_model.set_cvar_eta(cvar_eta)
 
 image = []
 eval_prompt_list = []
@@ -97,20 +109,20 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images"):
     eval_prompts = [prompt] * args.bs
     eval_prompt_list.extend(eval_prompts)
 
-    # image_, kl_loss, final_normalized_ess = sd_model.sample_smc(
-    #     eval_prompts, 
-    #     num_images_per_prompt=1, 
-    #     eta=1.0, 
-    #     latents=init_i,
-    # ) # List of PIL.Image objects
-
-    image_, kl_loss, min_normalized_ess = sd_model.sample_risk_neutral_baseline(
+    image_, kl_loss, min_normalized_ess = sd_model.sample_smc(
         eval_prompts, 
         num_images_per_prompt=1, 
         eta=1.0, 
         latents=init_i,
-        sampler="smc",
     ) # List of PIL.Image objects
+
+    # image_, kl_loss, min_normalized_ess = sd_model.sample_risk_neutral_baseline(
+    #     eval_prompts, 
+    #     num_images_per_prompt=1, 
+    #     eta=1.0, 
+    #     latents=init_i,
+    #     sampler="smc",
+    # ) # List of PIL.Image objects
 
     image.extend(image_)
     KL_list.append(kl_loss)
@@ -135,7 +147,7 @@ elif args.reward == 'aesthetic':
     eval_model = MLPDiff().to(args.device)
     eval_model.requires_grad_(False)
     eval_model.eval()
-    s = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"), map_location=device, weights_only=True)
+    s = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"), map_location=args.device, weights_only=True)
     eval_model.load_state_dict(s)
     gt_dataset= AVACLIPDataset(image)
 
@@ -159,11 +171,11 @@ with torch.no_grad():
 
     eval_rewards = torch.tensor(eval_rewards)
 
-    print("min_normalized_ess:", ESS_list)
-    print(f"eval_{args.reward}_rewards:", eval_rewards)
+    print("min_min_normalized_ess:", np.min(ESS_list))
+    # print(f"eval_{args.reward}_rewards:", eval_rewards)
     print(f"eval_{args.reward}_rewards_mean:", torch.mean(eval_rewards))
     print(f"eval_{args.reward}_rewards_std:", torch.std(eval_rewards))
     eval_rewards = np.array(eval_rewards)
     print(f"Average of lower {1-args.cvar_beta} quantile:", np.mean(eval_rewards[eval_rewards <= np.quantile(eval_rewards, 1-args.cvar_beta)]))
 
-np.save(f"./output_smc/{args.reward}_{args.variant}_{args.duplicate_size}_street_smc_{args.seed}.npy", np.array(eval_rewards))
+np.save(f"./output_monkey/{args.reward}_{args.variant}_{args.bs}_monkey_smc_cvar_{args.seed}.npy", np.array(eval_rewards))

@@ -84,7 +84,7 @@ CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 class TrainConfig:
     model_id: str = "runwayml/stable-diffusion-v1-5"
     local_files_only: bool = False
-    device: str = "cuda:0"
+    device: str = "cuda:1"
     diffusion_dtype: str = "float32"
     oracle_dtype: str = "float32"
 
