@@ -109,6 +109,27 @@ def clip_preprocess(images):
     return images
 
 
+def get_clip_image_features(clip_model, pixel_values):
+    """Return projected CLIP image features across Transformers versions."""
+    output = clip_model.get_image_features(pixel_values=pixel_values)
+
+    # transformers<=4.30 returns the feature tensor directly. Newer releases
+    # return a model-output object whose projected feature is pooler_output.
+    if isinstance(output, torch.Tensor):
+        return output
+    if getattr(output, "image_embeds", None) is not None:
+        return output.image_embeds
+    if getattr(output, "pooler_output", None) is not None:
+        return output.pooler_output
+    if isinstance(output, (tuple, list)) and len(output) > 1:
+        return output[1]
+
+    raise TypeError(
+        "Unsupported CLIP get_image_features output type: "
+        f"{type(output).__name__}"
+    )
+
+
 @torch.no_grad()
 def decode_latents(pipe, latents):
     scaling_factor = getattr(pipe.vae.config, "scaling_factor", 0.18215)
@@ -126,8 +147,12 @@ def score_final_costs(args, pipe, aesthetic_oracle, latents):
     else:
         images_clip = clip_preprocess(images.float())
         oracle_dtype = next(aesthetic_oracle.parameters()).dtype
-        rewards, _ = aesthetic_oracle(images_clip.to(dtype=oracle_dtype))
-        rewards = rewards.float()
+        embed = get_clip_image_features(
+            aesthetic_oracle.clip,
+            images_clip.to(dtype=oracle_dtype),
+        )
+        embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
+        rewards = aesthetic_oracle.mlp(embed).squeeze(1).float()
 
     return -rewards.reshape(-1)
 
@@ -351,7 +376,10 @@ def latent_to_aesthetic_embed(pipe, aesthetic_oracle, latents):
     images = decode_latents(pipe, latents)
     images = clip_preprocess(images.float())
     clip_dtype = next(aesthetic_oracle.clip.parameters()).dtype
-    embed = aesthetic_oracle.clip.get_image_features(pixel_values=images.to(dtype=clip_dtype))
+    embed = get_clip_image_features(
+        aesthetic_oracle.clip,
+        images.to(dtype=clip_dtype),
+    )
     embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
     return embed.float()
 
