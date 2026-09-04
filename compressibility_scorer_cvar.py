@@ -105,11 +105,13 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
     """
     MC scorer for CVaR compressibility guidance.
 
-    Returns a positive, cost-like conditional tail value and not a reward.
+    Returns E[(c(x_0) - eta)^+ | x_t], without the 1 / (1 - beta)
+    scaling, and not a reward.
     """
 
     is_eta_conditioned_cvar = True
     output_is_cvar_cost = True
+    output_is_unscaled_positive_part = True
 
     def __init__(self, dtype=torch.float32, pathtomodel=None):
         super().__init__()
@@ -119,6 +121,9 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
         self.eta_radius = None
         self.alpha = None
         self.beta = None
+        self.eta_centers = {}
+        self.training_eta_radius = None
+        self.target = None
         if pathtomodel is not None:
             self.set_valuefunction(pathtomodel)
         self.eval()
@@ -129,6 +134,20 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
         self.eta_radius = float(checkpoint["eta_radius"])
         self.alpha = float(checkpoint.get("alpha", 10.0))
         self.beta = float(checkpoint["beta"])
+        self.eta_centers = {
+            str(key): float(value)
+            for key, value in checkpoint.get("eta_centers", {}).items()
+        }
+        self.training_eta_radius = checkpoint.get("training_eta_radius")
+        if self.training_eta_radius is not None:
+            self.training_eta_radius = float(self.training_eta_radius)
+        self.target = checkpoint.get("target")
+        if self.target != "positive_part_cost":
+            raise ValueError(
+                f"Unsupported checkpoint target {self.target!r}; expected "
+                "'positive_part_cost'. Retrain with the unscaled target before "
+                "using this sampler."
+            )
         time_encoding_dim = int(checkpoint.get("time_encoding_dim", 64))
 
         self.model = SinusoidalTimeEtaConvNet(

@@ -13,6 +13,23 @@ from diffusers_patch.utils import TemperatureScaler
 
 ASSETS_PATH = resources.files("assets")
 
+
+def _get_clip_image_features(clip_model, pixel_values):
+    """Return projected CLIP image features across Transformers versions."""
+    output = clip_model.get_image_features(pixel_values=pixel_values)
+    if isinstance(output, torch.Tensor):
+        return output
+    if getattr(output, "image_embeds", None) is not None:
+        return output.image_embeds
+    if getattr(output, "pooler_output", None) is not None:
+        return output.pooler_output
+    if isinstance(output, (tuple, list)) and len(output) > 1:
+        return output[1]
+    raise TypeError(
+        "Unsupported CLIP get_image_features output type: "
+        f"{type(output).__name__}"
+    )
+
 def classify_aesthetic_scores_easy(y):
     # Applying thresholds to map scores to classes
     class_labels = torch.zeros_like(y, dtype=torch.long)  # Ensure it's integer type for class labels
@@ -99,13 +116,13 @@ class AestheticScorerDiff(torch.nn.Module):
 
     def __call__(self, images):
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return self.mlp(embed).squeeze(1), embed
     
     def generate_feats(self, images):
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return embed
 
@@ -126,13 +143,13 @@ class AestheticScorerDiff_Time(torch.nn.Module):
 
     def __call__(self, images, timesteps): # timesteps: torch.randint(low=0, high=50, size=(32,))
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return self.mlp(embed, timesteps).squeeze(1), embed
     
     def generate_feats(self, images):
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return embed
 
@@ -171,7 +188,7 @@ class condition_AestheticScorerDiff(torch.nn.Module):
 
     def __call__(self, images):
         device = next(self.parameters()).device
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         
         logits = self.mlp(embed)

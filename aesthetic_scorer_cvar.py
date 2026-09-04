@@ -5,6 +5,23 @@ import torch.nn as nn
 from transformers import CLIPModel
 
 
+def _get_clip_image_features(clip_model, pixel_values):
+    """Return projected CLIP image features across Transformers versions."""
+    output = clip_model.get_image_features(pixel_values=pixel_values)
+    if isinstance(output, torch.Tensor):
+        return output
+    if getattr(output, "image_embeds", None) is not None:
+        return output.image_embeds
+    if getattr(output, "pooler_output", None) is not None:
+        return output.pooler_output
+    if isinstance(output, (tuple, list)) and len(output) > 1:
+        return output[1]
+    raise TypeError(
+        "Unsupported CLIP get_image_features output type: "
+        f"{type(output).__name__}"
+    )
+
+
 class MLPDiff_CVaR(nn.Module):
     """Aesthetic CVaR value model with explicit eta conditioning."""
 
@@ -64,14 +81,15 @@ class AestheticScorerDiff_CVaR(torch.nn.Module):
     """
     MC scorer for CVaR aesthetic guidance.
 
-    The returned prediction is a *cost-like* tail value
-        E[(c(x_0) - eta)^+ / (1 - beta) | x_t]
-    rather than a reward.  sd_pipeline_cvar.py should therefore consume this
-    value directly and must not negate it or apply another CVaR hinge.
+    The returned prediction is the unscaled positive-part value
+        E[(c(x_0) - eta)^+ | x_t]
+    rather than a reward. sd_pipeline_cvar.py consumes it directly, without
+    negating it or applying another hinge, and applies 1 / (1 - beta) once.
     """
 
     is_eta_conditioned_cvar = True
     output_is_cvar_cost = True
+    output_is_unscaled_positive_part = True
 
     def __init__(self, dtype=torch.float32, pathtomodel=None):
         super().__init__()
@@ -82,6 +100,9 @@ class AestheticScorerDiff_CVaR(torch.nn.Module):
         self.eta_radius = None
         self.alpha = None
         self.beta = None
+        self.eta_centers = {}
+        self.training_eta_radius = None
+        self.target = None
         if pathtomodel is not None:
             self.set_valuefunction(pathtomodel)
         self.eval()
@@ -92,6 +113,20 @@ class AestheticScorerDiff_CVaR(torch.nn.Module):
         self.eta_radius = float(checkpoint["eta_radius"])
         self.alpha = float(checkpoint.get("alpha", 10.0))
         self.beta = float(checkpoint["beta"])
+        self.eta_centers = {
+            str(key): float(value)
+            for key, value in checkpoint.get("eta_centers", {}).items()
+        }
+        self.training_eta_radius = checkpoint.get("training_eta_radius")
+        if self.training_eta_radius is not None:
+            self.training_eta_radius = float(self.training_eta_radius)
+        self.target = checkpoint.get("target")
+        if self.target != "positive_part_cost":
+            raise ValueError(
+                f"Unsupported checkpoint target {self.target!r}; expected "
+                "'positive_part_cost'. Retrain with the unscaled target before "
+                "using this sampler."
+            )
         time_encoding_dim = int(checkpoint.get("time_encoding_dim", 768))
 
         self.mlp = MLPDiff_CVaR(
@@ -108,12 +143,12 @@ class AestheticScorerDiff_CVaR(torch.nn.Module):
     def __call__(self, images, timesteps, eta):
         if self.mlp is None:
             raise RuntimeError("Call set_valuefunction(...) before using the CVaR scorer.")
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         predictions = self.mlp(embed, timesteps, eta).squeeze(1)
         return predictions, embed
 
     def generate_feats(self, images):
-        embed = self.clip.get_image_features(pixel_values=images)
+        embed = _get_clip_image_features(self.clip, images)
         embed = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         return embed

@@ -18,7 +18,14 @@ For PM mode, no value-network training is needed:
     log weight = - V_eta(x_t) / alpha
                = - ((cost - cvar_eta)^+) / (alpha * (1 - beta))
 
-MC mode is for a trained value/log-weight model.
+For MC mode with an eta-conditioned scorer, the network predicts the unscaled
+conditional positive part
+
+    H_eta(x_t) = E[(c(x_0) - eta)^+ | x_t].
+
+The pipeline applies the CVaR factor exactly once:
+
+    log weight = -H_eta(x_t) / (alpha * (1 - beta)).
 """
 
 from contextlib import contextmanager
@@ -168,6 +175,62 @@ def solve_cvar_eta_time0_from_costs(
     }
 
 
+def solve_cvar_eta_time0_ternary_from_costs(
+    costs: ArrayLike,
+    alpha: float,
+    beta: float,
+    num_iters: int = 80,
+    eta_bounds: Optional[Tuple[float, float]] = None,
+) -> Tuple[float, Dict[str, Any]]:
+    """Solve the empirical time-0 eta objective with ternary search."""
+    if alpha <= 0:
+        raise ValueError("alpha must be positive.")
+    if not (0.0 <= beta < 1.0):
+        raise ValueError("beta must satisfy 0 <= beta < 1.")
+    if num_iters < 1:
+        raise ValueError("num_iters must be at least 1.")
+
+    costs_np = _as_numpy_1d(costs, dtype=np.float64)
+    finite_costs = costs_np[np.isfinite(costs_np)]
+    if finite_costs.size == 0:
+        raise ValueError("Need at least one finite pre-trained cost sample.")
+
+    if eta_bounds is None:
+        left = float(np.min(finite_costs))
+        right = float(np.max(finite_costs))
+    else:
+        left, right = map(float, eta_bounds)
+        if left > right:
+            left, right = right, left
+
+    initial_bounds = (left, right)
+    for _ in range(int(num_iters)):
+        m1 = left + (right - left) / 3.0
+        m2 = right - (right - left) / 3.0
+        f1 = cvar_eta_time0_objective(m1, finite_costs, alpha, beta)
+        f2 = cvar_eta_time0_objective(m2, finite_costs, alpha, beta)
+        if f1 <= f2:
+            right = m2
+        else:
+            left = m1
+
+    eta_hat = 0.5 * (left + right)
+    return eta_hat, {
+        "method": "ternary",
+        "objective": cvar_eta_time0_objective(
+            eta_hat, finite_costs, alpha, beta
+        ),
+        "num_cost_samples": int(finite_costs.size),
+        "cost_min": float(np.min(finite_costs)),
+        "cost_max": float(np.max(finite_costs)),
+        "cost_mean": float(np.mean(finite_costs)),
+        "cost_std": float(np.std(finite_costs)),
+        "num_iters": int(num_iters),
+        "eta_bounds": initial_bounds,
+        "final_interval": (left, right),
+    }
+
+
 class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
     """
     Non-batched SVDD decoding with CVaR/tail-controlled resampling.
@@ -223,6 +286,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         cvar_eta: Optional[float] = None,
     ) -> None:
         self._validate_alpha_beta(alpha, beta)
+        self._validate_cvar_lambda(cvar_lambda)
         if duplicate_size < 1:
             raise ValueError("duplicate_size must be at least 1.")
         self.batch_size = batch_size
@@ -253,6 +317,13 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             self.scorer.requires_grad_(False)
         if hasattr(self.scorer, "eval"):
             self.scorer.eval()
+
+    def _uses_eta_conditioned_cvar_scorer(self) -> bool:
+        """Whether the active scorer directly predicts the unscaled hinge target."""
+        return bool(
+            getattr(getattr(self, "scorer", None), "is_eta_conditioned_cvar", False)
+            and getattr(getattr(self, "scorer", None), "output_is_cvar_cost", False)
+        )
 
     def setup_cvar_value_model(self, value_model: Any) -> None:
         """Placeholder hook for future MC-mode value/log-weight model."""
@@ -300,6 +371,26 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         self.pretrained_cost_samples = _as_numpy_1d(costs)
         return self.cvar_eta, info
 
+    def solve_cvar_eta_ternary_from_costs(
+        self,
+        costs: ArrayLike,
+        num_iters: int = 80,
+        eta_bounds: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Ternary-search and store cvar_eta from pre-computed base costs."""
+        self._ensure_cvar_defaults()
+        eta_hat, info = solve_cvar_eta_time0_ternary_from_costs(
+            costs=costs,
+            alpha=float(self.alpha),
+            beta=float(self.beta),
+            num_iters=num_iters,
+            eta_bounds=eta_bounds,
+        )
+        self.cvar_eta = float(eta_hat)
+        self.cvar_eta_info = info
+        self.pretrained_cost_samples = _as_numpy_1d(costs)
+        return self.cvar_eta, info
+
     @torch.no_grad()
     def solve_cvar_eta_from_pretrained(
         self,
@@ -316,6 +407,8 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         eta_bounds: Optional[Tuple[float, float]] = None,
         disable_safety_checker: bool = True,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        search_method: str = "grid",
+        ternary_num_iters: int = 80,
     ) -> Tuple[float, Dict[str, Any]]:
         """
         Approximate E_pre[...] by sampling from the unmodified pre-trained
@@ -336,11 +429,21 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             disable_safety_checker=disable_safety_checker,
             cross_attention_kwargs=cross_attention_kwargs,
         )
-        eta_hat, info = self.solve_cvar_eta_from_costs(
-            costs=costs,
-            grid_size=grid_size,
-            eta_bounds=eta_bounds,
-        )
+        if search_method == "grid":
+            eta_hat, info = self.solve_cvar_eta_from_costs(
+                costs=costs,
+                grid_size=grid_size,
+                eta_bounds=eta_bounds,
+            )
+            info["method"] = "grid"
+        elif search_method == "ternary":
+            eta_hat, info = self.solve_cvar_eta_ternary_from_costs(
+                costs=costs,
+                num_iters=ternary_num_iters,
+                eta_bounds=eta_bounds,
+            )
+        else:
+            raise ValueError("search_method must be 'grid' or 'ternary'.")
         info["num_pretrained_samples_requested"] = int(num_pretrained_samples)
         return eta_hat, info
 
@@ -841,6 +944,11 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             raise RuntimeError("Call setup_scorer(...) before calculate_mc_cvar_value(...).")
         if not hasattr(self, "reward"):
             raise RuntimeError("Call set_reward('compressibility' or 'aesthetic') first.")
+        if self._uses_eta_conditioned_cvar_scorer():
+            raise RuntimeError(
+                "The active scorer predicts E[(cost - eta)^+ | x_t], not a raw "
+                "reward. Use calculate_weighted_value(...) with cvar_lambda=1.0."
+            )
 
         batch_n = latents.shape[0]
 
@@ -886,6 +994,69 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         costs = -_as_numpy_1d(rewards)
 
         return costs
+
+    @torch.no_grad()
+    def calculate_mc_positive_part(
+        self,
+        latents: torch.FloatTensor,
+        t: torch.Tensor,
+        cvar_eta: float,
+    ) -> np.ndarray:
+        """Predict E[(c(x_0) - eta)^+ | x_t] with the eta-conditioned scorer."""
+        if not hasattr(self, "scorer"):
+            raise RuntimeError("Call setup_scorer(...) before MC scoring.")
+        if not self._uses_eta_conditioned_cvar_scorer():
+            raise TypeError(
+                "calculate_mc_positive_part(...) requires an eta-conditioned "
+                "CVaR scorer."
+            )
+        if not hasattr(self, "reward"):
+            raise RuntimeError("Call set_reward('compressibility' or 'aesthetic') first.")
+
+        batch_n = latents.shape[0]
+        if not isinstance(t, torch.Tensor):
+            timesteps = torch.tensor(t, device=latents.device)
+        else:
+            timesteps = t.to(latents.device)
+
+        if timesteps.ndim == 0:
+            timesteps = timesteps.repeat(batch_n)
+        elif timesteps.numel() == 1:
+            timesteps = timesteps.reshape(1).repeat(batch_n)
+        elif timesteps.numel() == batch_n:
+            timesteps = timesteps.reshape(batch_n)
+        else:
+            raise ValueError(
+                f"Expected timestep to be scalar or length {batch_n}, "
+                f"but got shape {tuple(timesteps.shape)}."
+            )
+
+        if self.reward == "compressibility":
+            values, _ = self.scorer(
+                latents,
+                timesteps=timesteps,
+                eta=float(cvar_eta),
+            )
+        elif self.reward == "aesthetic":
+            scaling_factor = getattr(self.vae.config, "scaling_factor", 0.18215)
+            im_pix_un = self.vae.decode(
+                latents.to(self.vae.dtype) / scaling_factor
+            ).sample
+            im_pix = ((im_pix_un / 2.0) + 0.5).clamp(0.0, 1.0)
+            im_pix = torchvision.transforms.Resize(224, antialias=False)(im_pix)
+            im_pix = torchvision.transforms.Normalize(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711],
+            )(im_pix).to(im_pix_un.dtype)
+            values, _ = self.scorer(
+                im_pix,
+                timesteps=timesteps,
+                eta=float(cvar_eta),
+            )
+        else:
+            raise ValueError("Invalid reward type. Expected 'compressibility' or 'aesthetic'.")
+
+        return _as_numpy_1d(values)
     
     @torch.no_grad()
     def calculate_cost(
@@ -965,6 +1136,24 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         eta_value = float(cvar_eta)
         lam = float(cvar_lambda)
         beta = float(self.beta)
+
+        if self.variant == "MC" and self._uses_eta_conditioned_cvar_scorer():
+            if not np.isclose(lam, 1.0):
+                raise NotImplementedError(
+                    "The eta-conditioned network only predicts the CVaR positive-part "
+                    "term, so cvar_lambda must be 1.0. A lambda < 1 mixture also "
+                    "requires a separate raw-cost value network."
+                )
+
+            positive_part = self.calculate_mc_positive_part(
+                latents=latents,
+                t=t,
+                cvar_eta=eta_value,
+            )
+            values = positive_part / (1.0 - beta)
+            if include_eta_constant:
+                values = values + eta_value
+            return _as_numpy_1d(values)
 
         costs = self.calculate_cost(
             latents=latents,
