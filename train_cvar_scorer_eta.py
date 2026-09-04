@@ -32,7 +32,21 @@ def parse():
     parser.add_argument("--model_id", type=str, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--output_dir", type=str, default="cvar_value_eta")
-    parser.add_argument("--valuefunction", type=str, default="")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default="",
+        help=(
+            "Resume training from a CVaR checkpoint. --num_train_steps is the "
+            "desired final global step, not the number of additional steps."
+        ),
+    )
+    parser.add_argument(
+        "--valuefunction",
+        type=str,
+        default="",
+        help="Legacy alias for --resume_from_checkpoint.",
+    )
 
     parser.add_argument("--prompt_fn", type=str, default="eval_aesthetic_animals")
     parser.add_argument("--prompt", type=str, default="")
@@ -72,6 +86,46 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def get_resume_path(args):
+    """Resolve the explicit resume argument and its legacy alias."""
+    if args.resume_from_checkpoint != "" and args.valuefunction != "":
+        raise ValueError(
+            "Use only one of --resume_from_checkpoint and --valuefunction."
+        )
+    return args.resume_from_checkpoint or args.valuefunction
+
+
+def capture_rng_state():
+    """Capture RNG state so future checkpoints can resume reproducibly."""
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """Restore RNG state saved by capture_rng_state."""
+    if not state:
+        return False
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if torch.cuda.is_available() and "cuda" in state:
+        saved_cuda_states = state["cuda"]
+        if len(saved_cuda_states) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(saved_cuda_states)
+        else:
+            print(
+                "warning: CUDA device count changed; CUDA RNG state was not restored."
+            )
+    return True
 
 
 def load_prompt_pool(args):
@@ -387,6 +441,7 @@ def latent_to_aesthetic_embed(pipe, aesthetic_oracle, latents):
 def save_checkpoint(
     args,
     model,
+    optimizer,
     eta_normalization_center,
     eta_normalization_radius,
     eta_centers,
@@ -395,6 +450,8 @@ def save_checkpoint(
 ):
     checkpoint = {
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "rng_state": capture_rng_state(),
         # These two values are consumed by the scorer to normalize absolute eta.
         "eta0": float(eta_normalization_center),
         "eta_radius": float(eta_normalization_radius),
@@ -417,9 +474,65 @@ def save_checkpoint(
 
 def main():
     args = parse()
+    resume_path = get_resume_path(args)
+    resume_checkpoint = None
+    if resume_path != "":
+        resume_checkpoint = torch.load(
+            resume_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        saved_reward = resume_checkpoint.get("reward")
+        if saved_reward is not None and saved_reward != args.reward:
+            raise ValueError(
+                f"Checkpoint reward is {saved_reward!r}, but --reward is "
+                f"{args.reward!r}."
+            )
+        saved_target = resume_checkpoint.get("target")
+        if saved_target not in {None, "positive_part_cost"}:
+            raise ValueError(
+                f"Checkpoint target is {saved_target!r}; expected "
+                "'positive_part_cost'."
+            )
+        if args.eta0 is not None:
+            raise ValueError(
+                "Do not pass --eta0 when resuming; eta centers are restored "
+                "from the checkpoint."
+            )
+
+        for name in ("alpha", "beta"):
+            saved_value = resume_checkpoint.get(name)
+            current_value = getattr(args, name)
+            if saved_value is not None and not math.isclose(
+                float(current_value),
+                float(saved_value),
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            ):
+                raise ValueError(
+                    f"--{name}={current_value} does not match checkpoint "
+                    f"{name}={saved_value}."
+                )
+
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
     prompt_pool = load_prompt_pool(args)
+
+    if resume_checkpoint is not None:
+        saved_eta_centers = resume_checkpoint.get("eta_centers")
+        if not saved_eta_centers:
+            raise ValueError(
+                "The resume checkpoint has no eta_centers metadata and cannot "
+                "safely resume shared eta-conditioned training."
+            )
+        saved_prompt_pool = list(saved_eta_centers.keys())
+        if prompt_pool != saved_prompt_pool:
+            raise ValueError(
+                "The current prompt pool does not exactly match the checkpoint. "
+                f"Current: {prompt_pool}; checkpoint: {saved_prompt_pool}."
+            )
+
     print("shared training prompts: ", prompt_pool)
 
     pipe = Decoding_nonbatch_SDPipeline_CVaR.from_pretrained(
@@ -441,20 +554,62 @@ def main():
         aesthetic_oracle.requires_grad_(False)
         aesthetic_oracle.eval()
 
-    if args.eta_radius is None:
-        if args.reward == "aesthetic":
-            args.eta_radius = 0.5
-        else:
-            args.eta_radius = 10.0
+    if resume_checkpoint is not None:
+        eta_centers = {
+            str(prompt): float(value)
+            for prompt, value in resume_checkpoint["eta_centers"].items()
+        }
+        base_costs = None
+        eta_info = {
+            prompt: {
+                "prompt": prompt,
+                "eta0": eta_centers[prompt],
+                "source": "resume_checkpoint",
+            }
+            for prompt in prompt_pool
+        }
 
-    if args.eta0 is None:
+        saved_training_radius = resume_checkpoint.get("training_eta_radius")
+        if saved_training_radius is None:
+            raise ValueError(
+                "The resume checkpoint has no training_eta_radius metadata."
+            )
+        saved_training_radius = float(saved_training_radius)
+        if args.eta_radius is None:
+            args.eta_radius = saved_training_radius
+        elif not math.isclose(
+            float(args.eta_radius), saved_training_radius, rel_tol=0.0, abs_tol=1e-8
+        ):
+            raise ValueError(
+                f"--eta_radius={args.eta_radius} does not match checkpoint "
+                f"training_eta_radius={saved_training_radius}."
+            )
+
+        eta_normalization_center = float(
+            resume_checkpoint.get(
+                "eta_normalization_center", resume_checkpoint["eta0"]
+            )
+        )
+        eta_normalization_radius = float(
+            resume_checkpoint.get(
+                "eta_normalization_radius", resume_checkpoint["eta_radius"]
+            )
+        )
+    else:
+        if args.eta_radius is None:
+            if args.reward == "aesthetic":
+                args.eta_radius = 0.5
+            else:
+                args.eta_radius = 10.0
+
+    if resume_checkpoint is None and args.eta0 is None:
         eta_centers, base_costs, eta_info = estimate_eta_centers(
             args,
             pipe,
             aesthetic_oracle,
             prompt_pool,
         )
-    else:
+    elif resume_checkpoint is None:
         # A command-line eta0 intentionally forces the same center for all prompts.
         eta_centers = {prompt: float(args.eta0) for prompt in prompt_pool}
         base_costs = None
@@ -467,15 +622,30 @@ def main():
             for prompt in prompt_pool
         }
 
-    # The network receives absolute eta. Normalize it with one range covering
-    # every prompt-specific local interval [eta0(prompt)-r, eta0(prompt)+r].
-    center_values = np.asarray(list(eta_centers.values()), dtype=np.float64)
-    eta_normalization_center = float(np.mean(center_values))
-    eta_normalization_radius = float(
-        np.max(np.abs(center_values - eta_normalization_center)) + args.eta_radius
-    )
+    if resume_checkpoint is None:
+        # The network receives absolute eta. Normalize it with one range covering
+        # every prompt-specific local interval [eta0(prompt)-r, eta0(prompt)+r].
+        center_values = np.asarray(list(eta_centers.values()), dtype=np.float64)
+        eta_normalization_center = float(np.mean(center_values))
+        eta_normalization_radius = float(
+            np.max(np.abs(center_values - eta_normalization_center)) + args.eta_radius
+        )
 
-    if args.time_encoding_dim is None:
+    if resume_checkpoint is not None:
+        saved_time_encoding_dim = int(
+            resume_checkpoint.get(
+                "time_encoding_dim",
+                768 if args.reward == "aesthetic" else 64,
+            )
+        )
+        if args.time_encoding_dim is None:
+            args.time_encoding_dim = saved_time_encoding_dim
+        elif args.time_encoding_dim != saved_time_encoding_dim:
+            raise ValueError(
+                f"--time_encoding_dim={args.time_encoding_dim} does not match "
+                f"checkpoint time_encoding_dim={saved_time_encoding_dim}."
+            )
+    elif args.time_encoding_dim is None:
         # Match the existing repo: aesthetic uses a 768-D time encoding,
         # compressibility uses a 64-D spatial time encoding.
         args.time_encoding_dim = 768 if args.reward == "aesthetic" else 64
@@ -520,19 +690,56 @@ def main():
             dtype=torch.float32,
         ).to(args.device)
 
-    if args.valuefunction != "":
-        checkpoint = torch.load(args.valuefunction, map_location=args.device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print("Value function loaded: ", args.valuefunction)
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
+    completed_step = 0
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        if "step" not in resume_checkpoint:
+            raise ValueError(
+                "The resume checkpoint has no global step metadata."
+            )
+        completed_step = int(resume_checkpoint["step"])
+
+        optimizer_state = resume_checkpoint.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            # Honor the current command-line optimization settings while keeping
+            # the saved Adam moments.
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr
+                param_group["weight_decay"] = args.weight_decay
+            print("optimizer state restored; using command-line lr/weight_decay")
+        else:
+            print(
+                "checkpoint has no optimizer state; starting a fresh optimizer "
+                "from the restored model weights"
+            )
+
+        if restore_rng_state(resume_checkpoint.get("rng_state")):
+            print("RNG state restored")
+        else:
+            # Older checkpoints did not save RNG state. Reset here because model
+            # construction above consumed random numbers before its weights were
+            # replaced by the checkpoint.
+            set_seed(args.seed)
+            print("checkpoint has no RNG state; RNG reset from --seed")
+
+        print("resumed checkpoint: ", resume_path)
+        print("completed global step: ", completed_step)
+
+    if completed_step >= args.num_train_steps:
+        raise ValueError(
+            f"Checkpoint is already at step {completed_step}, which is not below "
+            f"--num_train_steps={args.num_train_steps}. Set a larger final step."
+        )
+
     model.train()
-    for step in range(1, args.num_train_steps + 1):
+    for step in range(completed_step + 1, args.num_train_steps + 1):
         prompts = sample_prompts(prompt_pool, args.batch_size)
         states, final_costs = rollout_base(
             args,
@@ -580,7 +787,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
-        if step % args.log_every == 0 or step == 1:
+        if step % args.log_every == 0 or step == completed_step + 1:
             print(
                 "step: ",
                 step,
@@ -597,6 +804,7 @@ def main():
             save_checkpoint(
                 args,
                 model,
+                optimizer,
                 eta_normalization_center,
                 eta_normalization_radius,
                 eta_centers,
@@ -609,6 +817,7 @@ def main():
     save_checkpoint(
         args,
         model,
+        optimizer,
         eta_normalization_center,
         eta_normalization_radius,
         eta_centers,
