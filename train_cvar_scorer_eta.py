@@ -75,6 +75,12 @@ def parse():
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--time_encoding_dim", type=int, default=None)
+    parser.add_argument(
+        "--compressibility_prompt_encoding_dim",
+        type=int,
+        default=None,
+        help="Projected prompt dimension for compressibility CVaR (default: 64).",
+    )
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--log_every", type=int, default=10)
     return parser.parse_args()
@@ -182,6 +188,34 @@ def get_clip_image_features(clip_model, pixel_values):
         "Unsupported CLIP get_image_features output type: "
         f"{type(output).__name__}"
     )
+
+
+@torch.no_grad()
+def encode_prompt_features(pipe, prompts):
+    """Return one frozen, normalized SD text-encoder feature per prompt."""
+    text_inputs = pipe.tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids = text_inputs.input_ids.to(pipe._execution_device)
+    attention_mask = None
+    if getattr(pipe.text_encoder.config, "use_attention_mask", False):
+        attention_mask = text_inputs.attention_mask.to(pipe._execution_device)
+
+    output = pipe.text_encoder(input_ids, attention_mask=attention_mask)
+    pooled = getattr(output, "pooler_output", None)
+    if pooled is None:
+        hidden = output[0]
+        if attention_mask is None:
+            pooled = hidden.mean(dim=1)
+        else:
+            mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+    return F.normalize(pooled.float(), dim=-1)
 
 
 @torch.no_grad()
@@ -469,6 +503,17 @@ def save_checkpoint(
         "step": int(step),
         "args": vars(args),
     }
+    if args.reward == "compressibility":
+        checkpoint.update(
+            {
+                "prompt_conditioned": bool(model.prompt_conditioned),
+                "text_embedding_dim": int(model.text_embedding_dim),
+                "prompt_encoding_dim": int(model.prompt_encoding_dim),
+                "prompt_embedding_source": (
+                    "stable_diffusion_text_encoder_pooled_l2_normalized"
+                ),
+            }
+        )
     torch.save(checkpoint, path)
 
 
@@ -650,23 +695,71 @@ def main():
         # compressibility uses a 64-D spatial time encoding.
         args.time_encoding_dim = 768 if args.reward == "aesthetic" else 64
 
+    prompt_conditioned = False
+    text_embedding_dim = None
+    prompt_encoding_dim = None
+    if args.reward == "compressibility":
+        text_embedding_dim = int(pipe.text_encoder.config.hidden_size)
+        if resume_checkpoint is not None:
+            prompt_conditioned = bool(
+                resume_checkpoint.get("prompt_conditioned", False)
+            )
+            saved_text_embedding_dim = int(
+                resume_checkpoint.get("text_embedding_dim", text_embedding_dim)
+            )
+            if saved_text_embedding_dim != text_embedding_dim:
+                raise ValueError(
+                    f"Checkpoint text_embedding_dim={saved_text_embedding_dim} does "
+                    f"not match the current text encoder hidden "
+                    f"size={text_embedding_dim}."
+                )
+            text_embedding_dim = saved_text_embedding_dim
+            prompt_encoding_dim = int(
+                resume_checkpoint.get("prompt_encoding_dim", 64)
+            )
+            requested_prompt_dim = args.compressibility_prompt_encoding_dim
+            if (
+                requested_prompt_dim is not None
+                and requested_prompt_dim != prompt_encoding_dim
+            ):
+                raise ValueError(
+                    f"--compressibility_prompt_encoding_dim="
+                    f"{requested_prompt_dim} does not match checkpoint "
+                    f"prompt_encoding_dim={prompt_encoding_dim}."
+                )
+        else:
+            prompt_conditioned = True
+            prompt_encoding_dim = (
+                64
+                if args.compressibility_prompt_encoding_dim is None
+                else int(args.compressibility_prompt_encoding_dim)
+            )
+
     print("prompt eta centers: ", eta_centers)
     print("local training eta radius: ", args.eta_radius)
     print("eta normalization center: ", eta_normalization_center)
     print("eta normalization radius: ", eta_normalization_radius)
+    if args.reward == "compressibility":
+        print("prompt conditioned: ", prompt_conditioned)
+        print("prompt encoding dim: ", prompt_encoding_dim)
 
     with open(os.path.join(args.output_dir, "eta0.json"), "w") as f:
-        json.dump(
-            {
-                "eta_centers": eta_centers,
-                "training_eta_radius": float(args.eta_radius),
-                "eta_normalization_center": eta_normalization_center,
-                "eta_normalization_radius": eta_normalization_radius,
-                "per_prompt": eta_info,
-            },
-            f,
-            indent=2,
-        )
+        eta_metadata = {
+            "eta_centers": eta_centers,
+            "training_eta_radius": float(args.eta_radius),
+            "eta_normalization_center": eta_normalization_center,
+            "eta_normalization_radius": eta_normalization_radius,
+            "per_prompt": eta_info,
+        }
+        if args.reward == "compressibility":
+            eta_metadata.update(
+                {
+                    "prompt_conditioned": prompt_conditioned,
+                    "text_embedding_dim": text_embedding_dim,
+                    "prompt_encoding_dim": prompt_encoding_dim,
+                }
+            )
+        json.dump(eta_metadata, f, indent=2)
     if base_costs is not None:
         for prompt_index, prompt in enumerate(prompt_pool):
             np.save(
@@ -688,6 +781,9 @@ def main():
             eta0=eta_normalization_center,
             eta_radius=eta_normalization_radius,
             dtype=torch.float32,
+            prompt_conditioned=prompt_conditioned,
+            text_embedding_dim=text_embedding_dim,
+            prompt_encoding_dim=prompt_encoding_dim,
         ).to(args.device)
 
     optimizer = torch.optim.AdamW(
@@ -758,6 +854,9 @@ def main():
         # Learn E[(c(X_0) - eta)^+ | X_t] under the base-model rollout.
         # beta is used to determine eta0, but it does not scale this target.
         target = make_target(final_costs, eta)
+        prompt_embedding = None
+        if args.reward == "compressibility" and model.prompt_conditioned:
+            prompt_embedding = encode_prompt_features(pipe, prompts)
 
         optimizer.zero_grad(set_to_none=True)
         total_loss = torch.zeros((), device=final_costs.device, dtype=torch.float32)
@@ -775,7 +874,12 @@ def main():
                     embed = latent_to_aesthetic_embed(pipe, aesthetic_oracle, latents)
                 prediction = model(embed, timesteps, eta).squeeze(1)
             else:
-                prediction = model(latents.float(), timesteps, eta).squeeze(1)
+                prediction = model(
+                    latents.float(),
+                    timesteps,
+                    eta,
+                    prompt_embedding=prompt_embedding,
+                ).squeeze(1)
 
             total_loss = total_loss + F.mse_loss(
                 prediction.float(), target.float(), reduction="mean"

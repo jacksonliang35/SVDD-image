@@ -31,7 +31,7 @@ class ResidualBlock_CVaR(nn.Module):
 
 
 class SinusoidalTimeEtaConvNet(nn.Module):
-    """Latent-space CVaR value network with time and eta as inputs."""
+    """Latent-space CVaR value network with time, eta, and prompt inputs."""
 
     def __init__(
         self,
@@ -41,15 +41,33 @@ class SinusoidalTimeEtaConvNet(nn.Module):
         eta0=0.0,
         eta_radius=1.0,
         dtype=torch.float32,
+        prompt_conditioned=False,
+        text_embedding_dim=768,
+        prompt_encoding_dim=64,
     ):
         super().__init__()
         self.dtype = dtype
         self.time_encoding_dim = time_encoding_dim
+        self.prompt_conditioned = bool(prompt_conditioned)
+        self.text_embedding_dim = int(text_embedding_dim)
+        self.prompt_encoding_dim = int(prompt_encoding_dim)
         self.register_buffer("eta0", torch.tensor(float(eta0)), persistent=True)
         self.register_buffer("eta_radius", torch.tensor(float(eta_radius)), persistent=True)
 
+        if self.prompt_conditioned:
+            self.prompt_projection = nn.Sequential(
+                nn.Linear(self.text_embedding_dim, self.prompt_encoding_dim),
+                nn.SiLU(),
+            )
+        else:
+            self.prompt_projection = None
+
+        layer2_input_channels = 64 + time_encoding_dim + 1
+        if self.prompt_conditioned:
+            layer2_input_channels += self.prompt_encoding_dim
+
         self.layer1 = ResidualBlock_CVaR(num_channels, 64, stride=1)
-        self.layer2 = ResidualBlock_CVaR(64 + time_encoding_dim + 1, 128, stride=2)
+        self.layer2 = ResidualBlock_CVaR(layer2_input_channels, 128, stride=2)
         self.layer3 = ResidualBlock_CVaR(128, 256, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(256, num_classes)
@@ -85,15 +103,43 @@ class SinusoidalTimeEtaConvNet(nn.Module):
         eta = (eta - self.eta0) / radius
         return eta[:, None, None, None].repeat(1, 1, height, width)
 
-    def forward(self, x, timesteps, eta):
+    def encode_prompt(self, prompt_embedding, batch_size, height, width, device):
+        if not self.prompt_conditioned:
+            return None
+        if prompt_embedding is None:
+            raise ValueError(
+                "This compressibility CVaR model is prompt-conditioned; "
+                "provide prompt_embedding."
+            )
+
+        prompt_embedding = prompt_embedding.to(device=device, dtype=torch.float32)
+        expected_shape = (batch_size, self.text_embedding_dim)
+        if prompt_embedding.ndim != 2 or prompt_embedding.shape != expected_shape:
+            raise ValueError(
+                f"Expected prompt_embedding shape {expected_shape}, got "
+                f"{tuple(prompt_embedding.shape)}."
+            )
+
+        prompt_embedding = self.prompt_projection(prompt_embedding)
+        return prompt_embedding[:, :, None, None].expand(-1, -1, height, width)
+
+    def forward(self, x, timesteps, eta, prompt_embedding=None):
         out = self.layer1(x.to(self.dtype))
         timestep_embed = self.sinusoidal_encoding(timesteps, out.size(2), out.size(3))
         eta_embed = self.eta_encoding(
             eta, out.shape[0], out.size(2), out.size(3), out.device
         )
-        combined_input = torch.cat(
-            [out, timestep_embed.to(out.dtype), eta_embed.to(out.dtype)], dim=1
+        inputs = [out, timestep_embed.to(out.dtype), eta_embed.to(out.dtype)]
+        prompt_embed = self.encode_prompt(
+            prompt_embedding,
+            out.shape[0],
+            out.size(2),
+            out.size(3),
+            out.device,
         )
+        if prompt_embed is not None:
+            inputs.append(prompt_embed.to(out.dtype))
+        combined_input = torch.cat(inputs, dim=1)
         out = self.layer2(combined_input)
         out = self.layer3(out)
         out = self.avgpool(out)
@@ -105,7 +151,7 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
     """
     MC scorer for CVaR compressibility guidance.
 
-    Returns E[(c(x_0) - eta)^+ | x_t], without the 1 / (1 - beta)
+    Returns E[(c(x_0) - eta)^+ | x_t, prompt], without the 1 / (1 - beta)
     scaling, and not a reward.
     """
 
@@ -124,6 +170,9 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
         self.eta_centers = {}
         self.training_eta_radius = None
         self.target = None
+        self.prompt_conditioned = False
+        self.text_embedding_dim = 768
+        self.prompt_encoding_dim = 64
         if pathtomodel is not None:
             self.set_valuefunction(pathtomodel)
         self.eval()
@@ -149,6 +198,9 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
                 "using this sampler."
             )
         time_encoding_dim = int(checkpoint.get("time_encoding_dim", 64))
+        self.prompt_conditioned = bool(checkpoint.get("prompt_conditioned", False))
+        self.text_embedding_dim = int(checkpoint.get("text_embedding_dim", 768))
+        self.prompt_encoding_dim = int(checkpoint.get("prompt_encoding_dim", 64))
 
         self.model = SinusoidalTimeEtaConvNet(
             num_channels=4,
@@ -157,6 +209,9 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
             eta0=self.eta0,
             eta_radius=self.eta_radius,
             dtype=self.dtype,
+            prompt_conditioned=self.prompt_conditioned,
+            text_embedding_dim=self.text_embedding_dim,
+            prompt_encoding_dim=self.prompt_encoding_dim,
         )
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
@@ -164,8 +219,13 @@ class CompressibilityScorerDiff_CVaR(torch.nn.Module):
         print("eta_0: ", self.eta0, " eta_radius: ", self.eta_radius)
         return self
 
-    def __call__(self, images, timesteps, eta):
+    def __call__(self, images, timesteps, eta, prompt_embedding=None):
         if self.model is None:
             raise RuntimeError("Call set_valuefunction(...) before using the CVaR scorer.")
-        predictions = self.model(images, timesteps, eta).squeeze(1)
+        predictions = self.model(
+            images,
+            timesteps,
+            eta,
+            prompt_embedding=prompt_embedding,
+        ).squeeze(1)
         return predictions, images
