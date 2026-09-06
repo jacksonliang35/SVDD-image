@@ -527,100 +527,44 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
         kl_loss = 0
 
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+        # with self.progress_bar(total=num_inference_steps) as progress_bar:
+        for i, t in enumerate(timesteps):
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                ).sample
+            # predict the noise residual
+            noise_pred = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                cross_attention_kwargs=cross_attention_kwargs,
+            ).sample
 
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    old_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-
-
-                noise_pred = old_noise_pred
-
-                ############################################################
-                ############################################################
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                old_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
 
-                # compute the previous noisy sample x_t -> x_t-1
-                # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                # Decoding: I Changed this part: We get multiple samples for each particle [Batch_size * Duplicates , 4, 64, 64  ]
-                # The following generates [Batch_size * Duplicates , 4, 64, 64  ]
-                if i < len(timesteps) - 1:
-                    weights_list = [ ]
-                    latents_list = [ ]
-                    for ttt in range(self.duplicate):
-                        with torch.no_grad():
-                            latents_duplicate, kl_terms = ddim_step_KL(
-                                                self.scheduler,
-                                                noise_pred,   # (2,4,64,64),
-                                                old_noise_pred, # (2,4,64,64),
-                                                t,
-                                                latents,
-                                                eta=eta,  # 1.0
-                                            )
-                            kl_loss += torch.mean(kl_terms)
-                    ##### Start Calcuate Next Weight (Value functions)
+            noise_pred = old_noise_pred
 
-                        # MC scores x_t directly; only PM needs predicted x_0.
-                        new_noise_pred = None
-                        if self.variant == 'PM':
-                            latent_model_input = torch.cat([latents_duplicate] * 2)
-                            latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps[i+1])
-                            noise_pred_duplicate = self.unet(latent_model_input, timesteps[i+1], encoder_hidden_states=prompt_embeds, cross_attention_kwargs=cross_attention_kwargs).sample
-                            noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
-                            new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                        weights =  self.calculate_weight(
-                                    latents_duplicate,
-                                    new_noise_pred, timesteps[i+1]
-                                )
-                        if  self.variant == 'PM' and self.reward == 'compressibility':
-                            pass
-                        else:
-                            # Transfer the small score matrix once after generation.
-                            weights = weights.detach()
-                        weights_list.append(weights)
-                        latents_list.append(latents_duplicate.detach())
+            ############################################################
+            ############################################################
 
-                    if self.variant == 'PM' and self.reward == 'compressibility':
-                        weights_list = np.array(weights_list)
-                    else:
-                        weights_list = torch.stack(weights_list).cpu().numpy()
-                    #index_chosen = [ ]
-                    #for i in range(self.batch_size):
-                    #    index_chosen.append(i *self.duplicate + np.argmax(weights_list[i*self.duplicate : (i+1)*self.duplicate]))
-                    #latents = latents_list[index_chosen, :, :, :]
 
-                    index_chosen = []
-                    for b in range(latents.shape[0]):
-                        scores_b = weights_list[:, b]
-                        probs_b = self.score_to_probs(scores_b, alpha=self.alpha)
-                        chosen_dup = np.random.choice(self.duplicate, p=probs_b)
-                        index_chosen.append(chosen_dup)
-                    # index_chosen = np.argmax(weights_list,0)
+            # compute the previous noisy sample x_t -> x_t-1
+            # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                    # Gather selected candidates on their existing device.
-                    latents = torch.stack([
-                        latents_list[chosen][b]
-                        for b, chosen in enumerate(index_chosen)
-                    ])
-                    del latents_list, weights_list
-                else:  #If we are in the last step
+            # Decoding: I Changed this part: We get multiple samples for each particle [Batch_size * Duplicates , 4, 64, 64  ]
+            # The following generates [Batch_size * Duplicates , 4, 64, 64  ]
+            if i < len(timesteps) - 1:
+                weights_list = [ ]
+                latents_list = [ ]
+                for ttt in range(self.duplicate):
                     with torch.no_grad():
-                        latents, kl_terms = ddim_step_KL(
+                        latents_duplicate, kl_terms = ddim_step_KL(
                                             self.scheduler,
                                             noise_pred,   # (2,4,64,64),
                                             old_noise_pred, # (2,4,64,64),
@@ -628,13 +572,69 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
                                             latents,
                                             eta=eta,  # 1.0
                                         )
+                        kl_loss += torch.mean(kl_terms)
+                ##### Start Calcuate Next Weight (Value functions)
+
+                    # MC scores x_t directly; only PM needs predicted x_0.
+                    new_noise_pred = None
+                    if self.variant == 'PM':
+                        latent_model_input = torch.cat([latents_duplicate] * 2)
+                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps[i+1])
+                        noise_pred_duplicate = self.unet(latent_model_input, timesteps[i+1], encoder_hidden_states=prompt_embeds, cross_attention_kwargs=cross_attention_kwargs).sample
+                        noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
+                        new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    weights =  self.calculate_weight(
+                                latents_duplicate,
+                                new_noise_pred, timesteps[i+1]
+                            )
+                    if  self.variant == 'PM' and self.reward == 'compressibility':
+                        pass
+                    else:
+                        # Transfer the small score matrix once after generation.
+                        weights = weights.detach()
+                    weights_list.append(weights)
+                    latents_list.append(latents_duplicate.detach())
+
+                if self.variant == 'PM' and self.reward == 'compressibility':
+                    weights_list = np.array(weights_list)
+                else:
+                    weights_list = torch.stack(weights_list).cpu().numpy()
+                #index_chosen = [ ]
+                #for i in range(self.batch_size):
+                #    index_chosen.append(i *self.duplicate + np.argmax(weights_list[i*self.duplicate : (i+1)*self.duplicate]))
+                #latents = latents_list[index_chosen, :, :, :]
+
+                index_chosen = []
+                for b in range(latents.shape[0]):
+                    scores_b = weights_list[:, b]
+                    probs_b = self.score_to_probs(scores_b, alpha=self.alpha)
+                    chosen_dup = np.random.choice(self.duplicate, p=probs_b)
+                    index_chosen.append(chosen_dup)
+                # index_chosen = np.argmax(weights_list,0)
+
+                # Gather selected candidates on their existing device.
+                latents = torch.stack([
+                    latents_list[chosen][b]
+                    for b, chosen in enumerate(index_chosen)
+                ])
+                del latents_list, weights_list
+            else:  #If we are in the last step
+                with torch.no_grad():
+                    latents, kl_terms = ddim_step_KL(
+                                        self.scheduler,
+                                        noise_pred,   # (2,4,64,64),
+                                        old_noise_pred, # (2,4,64,64),
+                                        t,
+                                        latents,
+                                        eta=eta,  # 1.0
+                                    )
 
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                # # call the callback, if provided
+                # if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                #     progress_bar.update()
+                #     if callback is not None and i % callback_steps == 0:
+                #         callback(i, t, latents)
 
         if output_type == "latent":
             image = latents
