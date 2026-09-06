@@ -575,11 +575,14 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
                             kl_loss += torch.mean(kl_terms)
                     ##### Start Calcuate Next Weight (Value functions)
 
-                        latent_model_input = torch.cat([latents_duplicate] * 2)
-                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps[i+1])
-                        noise_pred_duplicate = self.unet(latent_model_input, timesteps[i+1], encoder_hidden_states= prompt_embeds, cross_attention_kwargs=cross_attention_kwargs).sample
-                        noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
-                        new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # Get noises corresponding to latents
+                        # MC scores x_t directly; only PM needs predicted x_0.
+                        new_noise_pred = None
+                        if self.variant == 'PM':
+                            latent_model_input = torch.cat([latents_duplicate] * 2)
+                            latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps[i+1])
+                            noise_pred_duplicate = self.unet(latent_model_input, timesteps[i+1], encoder_hidden_states=prompt_embeds, cross_attention_kwargs=cross_attention_kwargs).sample
+                            noise_pred_uncond, noise_pred_text = noise_pred_duplicate.chunk(2)
+                            new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                         weights =  self.calculate_weight(
                                     latents_duplicate,
                                     new_noise_pred, timesteps[i+1]
@@ -587,27 +590,34 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
                         if  self.variant == 'PM' and self.reward == 'compressibility':
                             pass
                         else:
-                            weights = weights.cpu().detach().numpy()
+                            # Transfer the small score matrix once after generation.
+                            weights = weights.detach()
                         weights_list.append(weights)
-                        latents_list.append(latents_duplicate.cpu().detach().numpy())
+                        latents_list.append(latents_duplicate.detach())
 
-                    weights_list = np.array(weights_list)
-                    latents_list = np.array(latents_list)
+                    if self.variant == 'PM' and self.reward == 'compressibility':
+                        weights_list = np.array(weights_list)
+                    else:
+                        weights_list = torch.stack(weights_list).cpu().numpy()
                     #index_chosen = [ ]
                     #for i in range(self.batch_size):
                     #    index_chosen.append(i *self.duplicate + np.argmax(weights_list[i*self.duplicate : (i+1)*self.duplicate]))
                     #latents = latents_list[index_chosen, :, :, :]
 
                     index_chosen = []
-                    for b in range(self.batch_size):
+                    for b in range(latents.shape[0]):
                         scores_b = weights_list[:, b]
                         probs_b = self.score_to_probs(scores_b, alpha=self.alpha)
                         chosen_dup = np.random.choice(self.duplicate, p=probs_b)
                         index_chosen.append(chosen_dup)
                     # index_chosen = np.argmax(weights_list,0)
 
-                    latents = np.array([latents_list[ index_chosen[i], i, :, :,:]  for i in range(self.batch_size)])
-                    latents = torch.tensor(latents).to(device)
+                    # Gather selected candidates on their existing device.
+                    latents = torch.stack([
+                        latents_list[chosen][b]
+                        for b, chosen in enumerate(index_chosen)
+                    ])
+                    del latents_list, weights_list
                 else:  #If we are in the last step
                     with torch.no_grad():
                         latents, kl_terms = ddim_step_KL(
@@ -993,6 +1003,12 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
 
     @torch.no_grad()
     def calculate_weight(self, latents, new_noise_pred, t): # t = 981, 961, 941 ..
+
+        if self.variant == 'MC' and self.reward == 'compressibility':
+            # The vanilla compressibility value network consumes latents.
+            # Decoding/resizing/normalizing images here would be unused work.
+            weights, _ = self.scorer(latents, timesteps=t.repeat(latents.shape[0]))
+            return weights
 
         if  self.variant == 'PM' and self.reward == 'compressibility':
             pred_original_sample = predict_x0_from_xt(
