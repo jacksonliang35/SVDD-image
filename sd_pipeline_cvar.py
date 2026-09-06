@@ -28,6 +28,8 @@ The pipeline applies the CVaR factor exactly once:
     log weight = -H_eta(x_t) / (alpha * (1 - beta)).
 """
 
+from aesthetic_latent_sampling import with_aesthetic_prompt_context, uses_latent_aesthetic, score_latent_aesthetic
+
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -409,6 +411,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         search_method: str = "grid",
         ternary_num_iters: int = 80,
+        ddim_eta: float = 0.0,
     ) -> Tuple[float, Dict[str, Any]]:
         """
         Approximate E_pre[...] by sampling from the unmodified pre-trained
@@ -428,6 +431,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
             generator=generator,
             disable_safety_checker=disable_safety_checker,
             cross_attention_kwargs=cross_attention_kwargs,
+            ddim_eta=ddim_eta,
         )
         if search_method == "grid":
             eta_hat, info = self.solve_cvar_eta_from_costs(
@@ -461,6 +465,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         disable_safety_checker: bool = True,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        ddim_eta: float = 0.0,
     ) -> np.ndarray:
         """Generate pre-trained samples and return cost = -reward for each image."""
         self._ensure_cvar_defaults()
@@ -490,7 +495,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                     guidance_scale=guidance_scale,
                     negative_prompt=batch_negative_prompt,
                     num_images_per_prompt=1,
-                    eta=0.0,
+                    eta=ddim_eta,
                     generator=batch_generator,
                     output_type="np",
                     return_dict=True,
@@ -970,7 +975,9 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                 f"but got shape {tuple(timesteps.shape)}."
             )
 
-        if self.reward == "compressibility":
+        if uses_latent_aesthetic(self):
+            rewards, _ = score_latent_aesthetic(self, latents, timesteps)
+        elif self.reward == "compressibility":
             rewards, _ = self.scorer(latents, timesteps=timesteps)
 
         elif self.reward == "aesthetic":
@@ -1031,7 +1038,9 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
                 f"but got shape {tuple(timesteps.shape)}."
             )
 
-        if self.reward == "compressibility":
+        if uses_latent_aesthetic(self):
+            values, _ = score_latent_aesthetic(self, latents, timesteps, eta=float(cvar_eta))
+        elif self.reward == "compressibility":
             values, _ = self.scorer(
                 latents,
                 timesteps=timesteps,
@@ -1280,6 +1289,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
     # ---------------------------------------------------------------------
 
     @torch.inference_mode()
+    @with_aesthetic_prompt_context
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
@@ -1578,6 +1588,7 @@ class Decoding_nonbatch_SDPipeline_CVaR(StableDiffusionPipeline):
         return image, kl_loss
 
     @torch.inference_mode()
+    @with_aesthetic_prompt_context
     def sample_max(
         self,
         prompt: Union[str, List[str]] = None,

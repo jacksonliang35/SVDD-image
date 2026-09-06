@@ -1,3 +1,4 @@
+from aesthetic_latent_sampling import with_aesthetic_prompt_context, uses_latent_aesthetic, score_latent_aesthetic
 from diffusers import StableDiffusionPipeline
 import torch
 from transformers import CLIPModel, CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
@@ -380,6 +381,7 @@ class SMC_SDPipeline(StableDiffusionPipeline):
 
 class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
     @torch.no_grad()
+    @with_aesthetic_prompt_context
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
@@ -675,6 +677,7 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
         return image, kl_loss
 
     @torch.no_grad()
+    @with_aesthetic_prompt_context
     def sample_max(
         self,
         prompt: Union[str, List[str]] = None,
@@ -1003,6 +1006,12 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
 
     @torch.no_grad()
     def calculate_weight(self, latents, new_noise_pred, t): # t = 981, 961, 941 ..
+
+        if uses_latent_aesthetic(self):
+            if self.variant != 'MC' or getattr(self.scorer, 'is_eta_conditioned_cvar', False):
+                raise ValueError('Vanilla MC requires a latent expected-reward scorer')
+            weights, _ = score_latent_aesthetic(self, latents, t)
+            return weights
 
         if self.variant == 'MC' and self.reward == 'compressibility':
             # The vanilla compressibility value network consumes latents.
